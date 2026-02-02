@@ -55,11 +55,23 @@
 #define PCLK_GPIO_NUM     13
 
 // ================= EEPROM SETTINGS =================
-#define EEPROM_SIZE 64
-#define EEPROM_ADDR 0
+#define EEPROM_SIZE       64
+#define EEPROM_ADDR       0
+
+// ================= CAMERA SETTINGS =================
+#define PHOTO_MODE        PIXFORMAT_JPEG
+#define PHOTO_RESOLUTION  FRAMESIZE_HD
+
+#define VIDEO_MODE        PIXFORMAT_JPEG
+#define VIDEO_RESOLUTION  FRAMESIZE_HVGA
+
+#define IDLE_MODE         PIXFORMAT_RGB565
+#define IDLE_RESOLUTION   FRAMESIZE_QQVGA
+
+#define REC_JPEG_QUALITY  12
+#define IDLE_JPEG_QUALITY 0
 
 // ================= STRUCTS & GLOBALS =================
-
 struct SDStatus {
   bool isMounted;     // is the card inserted and mounted
   bool isFull;        // is the card full
@@ -70,10 +82,21 @@ SDStatus globalSDState = {false, false, "NO CARD"};
 int pictureNumber = 0;
 bool mirror = true;
 
+bool isRecording = false;
+unsigned long recordingStartTime = 0;
+File videoFile;
+
 SemaphoreHandle_t sdMutex;  // to prevent simultaneous access to the SD card
 SemaphoreHandle_t tftMutex; // to prevent typing on the screen simultaneously
 
 camera_config_t config;
+
+// ================= AVI HEADER VARIABLES =================
+const int avi_header_size = 252; 
+long avi_movi_size = 0;
+long avi_index_size = 0;
+unsigned long avi_start_time = 0;
+int avi_total_frames = 0;
 
 // ================= TFT CLASS =================
 class LGFX : public lgfx::LGFX_Device {
@@ -175,7 +198,7 @@ void setup() {
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   
-  initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 0);
+  initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
 
   delay(3000);
 
@@ -216,6 +239,13 @@ void loop() {
 void taskSDMonitor(void *pvParameters) {
   while (true) {
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+
+      // do not occupy the SD card during recording
+      if(isRecording) {
+        xSemaphoreGive(sdMutex);
+        vTaskDelay(2000);
+        continue;
+      }
       
       bool currentMount = false;
       bool currentFull = false;
@@ -270,7 +300,10 @@ void taskCamera(void *pvParameters) {
   uint32_t frame_count = 0;
   float fps = 0;
   static int fail_count = 0;
+
   static bool lastBtn = HIGH;
+  static bool lastShutterState = HIGH; 
+  unsigned long shutterPressTime = 0;
 
   while (true) {
     camera_fb_t *fb = esp_camera_fb_get();
@@ -279,13 +312,24 @@ void taskCamera(void *pvParameters) {
       fail_count++;
       Serial.printf("Cam Fail: %d\n", fail_count);
       if (fail_count > 10) {
+        if (isRecording) {
+          stopVideoRecording(); 
+          if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
+            tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+            tft.drawString("REC SAVED (ERR)", 10, 80);
+            xSemaphoreGive(tftMutex);
+          }
+          delay(1000);
+        }
+
         if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
           tft.fillScreen(TFT_RED);
           tft.drawString("CAM RESET...", 10, 60);
           xSemaphoreGive(tftMutex);
         }
         delay(100);
-        initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 0);
+        if(isRecording) initCamera(VIDEO_MODE, VIDEO_RESOLUTION, REC_JPEG_QUALITY);
+        else initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
         fail_count = 0;
       }
       vTaskDelay(10); 
@@ -303,56 +347,120 @@ void taskCamera(void *pvParameters) {
     }
     lastBtn = btnNow;
 
-    // for taking a picture of that lovely view
-    if (digitalRead(SHUTTER_BTN_PIN) == LOW) {
+    int shutterState = digitalRead(SHUTTER_BTN_PIN);
+
+    // capture the moment it's pressed
+    if (lastShutterState == HIGH && shutterState == LOW) {
+      shutterPressTime = millis();
+    }
+
+    // capture the moment it's released
+    else if (lastShutterState == LOW && shutterState == HIGH) {
+      unsigned long duration = millis() - shutterPressTime;
       
-      bool canSave = false;
-      String errMsg = "";
-      
-      if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100))) {
-        if (!globalSDState.isMounted) {
-          errMsg = "NO SD CARD!";
+      // short press (< 1 sec) and if not recording -> take a photo
+      if (!isRecording && duration < 1000) {
+        
+        bool canSave = false;
+        String errMsg = "";
+        
+        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100))) {
+          if (!globalSDState.isMounted) errMsg = "NO SD CARD!";
+          else if (globalSDState.isFull) errMsg = "SD FULL!";
+          else canSave = true;
+          xSemaphoreGive(sdMutex);
         }
-        else if (globalSDState.isFull) {
-          errMsg = "SD FULL!";
+
+        if (!canSave) {
+          if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
+            tft.setCursor(0, 0);
+            tft.setTextColor(TFT_RED, TFT_BLACK);
+            tft.print(errMsg);
+            xSemaphoreGive(tftMutex);
+          }
+          vTaskDelay(1000);
         }
         else {
-          canSave = true;
+          esp_camera_fb_return(fb);
+          savePhotoHighRes();
+          fb = NULL;
         }
+      }
+      
+      // if it's recording and enough time has passed -> stop recording
+      // (ignore any stops within the first 2 seconds after recording starts)
+      else if (isRecording) {
+        if (millis() - recordingStartTime > 2000) {
+          stopVideoRecording();
+          esp_camera_fb_return(fb);
+          fb = NULL;
+          initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY); // back to normal mode
+        }
+      }
+    }
+
+    // long press (> 1 sec) -> record video
+    if (shutterState == LOW && !isRecording && (millis() - shutterPressTime > 1000)) {
+       
+      esp_camera_fb_return(fb); 
+      fb = NULL;
+      
+      bool cardReady = false;
+      if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100))) {
+        cardReady = (globalSDState.isMounted && !globalSDState.isFull);
         xSemaphoreGive(sdMutex);
       }
 
-      if (!canSave) {
+      if(cardReady) {
+        initCamera(VIDEO_MODE, VIDEO_RESOLUTION, REC_JPEG_QUALITY);
+        startVideoRecording(); 
+        recordingStartTime = millis();
+      }
+      else {
         if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
-          tft.setCursor(0, 0);
           tft.setTextColor(TFT_RED, TFT_BLACK);
-          tft.print(errMsg);
+          tft.drawString("NO SD / FULL", 20, 60);
           xSemaphoreGive(tftMutex);
         }
         vTaskDelay(1000);
       }
-      else {
-        esp_camera_fb_return(fb);
-        savePhotoHighRes();
-        fb = NULL;
-      }
-
-      while(digitalRead(SHUTTER_BTN_PIN) == LOW) vTaskDelay(10);
-      
-      if (fb) esp_camera_fb_return(fb);
-      continue; 
     }
+    
+    lastShutterState = shutterState;
+
+    if (!fb) continue;
 
     // printing to screen
     if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
       tft.startWrite();
       if (fb) {
-        for (int y = 0; y < 112; y++) { // displaying 160x112 pixels. last 16 pixel row is for FPS indicator.
-          tft.pushImage(0, y, 160, 1, (uint16_t *)(fb->buf + y * 160 * 2));
+        if (isRecording) {
+          // printing video visuals to the screen
+          // this is not working good right now. going to try to fix this later
+          tft.drawJpg(fb->buf, fb->len, 0, 0, 160, 120);
+          // recording icon
+          if ((millis() / 500) % 2 == 0) tft.fillCircle(10, 10, 4, TFT_RED);
+          else tft.fillCircle(10, 10, 4, TFT_BLACK);
+        }
+        else {
+          // printing what the cam sees to the screen when no photos or videos are being taken
+          for (int y = 0; y < 112; y++) { // displaying 160x112 pixels. last 16 pixel row is for FPS indicator.
+            tft.pushImage(0, y, 160, 1, (uint16_t *)(fb->buf + y * 160 * 2));
+          }
         }
       }
       tft.endWrite();
       xSemaphoreGive(tftMutex);
+    }
+
+    // video recording
+    if (isRecording && fb->format == PIXFORMAT_JPEG) {
+      if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(50))) {
+        if (videoFile) {
+          writeAVIFrame(videoFile, fb);
+        }
+        xSemaphoreGive(sdMutex);
+      }
     }
 
     if (fb) esp_camera_fb_return(fb);
@@ -401,7 +509,7 @@ void savePhotoHighRes() {
 
   Serial.println("--- HD Mode Start ---");
 
-  initCamera(PIXFORMAT_JPEG, FRAMESIZE_HD, 12);
+  initCamera(PHOTO_MODE, PHOTO_RESOLUTION, REC_JPEG_QUALITY);
   
   // warm up
   camera_fb_t *fb = NULL;
@@ -468,8 +576,8 @@ void savePhotoHighRes() {
     esp_camera_fb_return(fb);
   }
 
-  Serial.println("--- Returning to Video Mode ---");
-  initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 0);
+  Serial.println("--- Returning to Idle Mode ---");
+  initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
 
   vTaskDelay(1000); 
 }
@@ -482,10 +590,6 @@ void initCamera(pixformat_t format, framesize_t size, int jpeg_quality) {
   config.jpeg_quality = jpeg_quality;
   config.fb_count = 2; 
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  
-  if (format == PIXFORMAT_JPEG) {
-      config.fb_count = 2; 
-  }
 
   if (esp_camera_init(&config) != ESP_OK) {
     Serial.println("Cam init error");
@@ -515,4 +619,172 @@ void initCamera(pixformat_t format, framesize_t size, int jpeg_quality) {
     
     s->set_hmirror(s, mirror);
   }
+  delay(100);
+}
+
+void startVideoRecording() {
+  if (xSemaphoreTake(sdMutex, portMAX_DELAY)) {
+    String path = "/vid_" + String(pictureNumber) + ".avi"; 
+    Serial.printf("Video Start: %s\n", path.c_str());
+    
+    videoFile = SD.open(path.c_str(), FILE_WRITE);
+    if (videoFile) {
+      isRecording = true;
+      pictureNumber++;
+      EEPROM.writeInt(EEPROM_ADDR, pictureNumber);
+      EEPROM.commit();
+      
+      startAVI(videoFile, 10, 240, 176); 
+    }
+    else {
+      Serial.println("Video file create failed");
+    }
+    xSemaphoreGive(sdMutex);
+  }
+}
+
+void stopVideoRecording() {
+  if (xSemaphoreTake(sdMutex, portMAX_DELAY)) {
+    if (videoFile) {
+      endAVI(videoFile, 10, 240, 176); 
+      Serial.println("Video Saved.");
+      
+      if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
+        tft.fillScreen(TFT_GREEN);
+        tft.setTextColor(TFT_BLACK);
+        tft.drawString("VIDEO SAVED", 30, 60);
+        xSemaphoreGive(tftMutex);
+      }
+      delay(1000);
+    }
+    isRecording = false;
+    xSemaphoreGive(sdMutex);
+  }
+}
+
+void startAVI(File &file, int fps, int width, int height) {
+  avi_movi_size = 0;
+  avi_total_frames = 0;
+  avi_start_time = millis();
+  
+  uint8_t zero_buf[avi_header_size];
+  memset(zero_buf, 0, avi_header_size);
+  file.write(zero_buf, avi_header_size);
+}
+
+void writeAVIFrame(File &file, camera_fb_t *fb) {
+  uint8_t dc_buf[4] = {0x30, 0x30, 0x64, 0x63}; 
+  file.write(dc_buf, 4);
+
+  uint32_t len = fb->len;
+  uint32_t rem = len % 4;
+  uint32_t padding = (rem == 0) ? 0 : 4 - rem;
+  uint32_t totalLen = len + padding;
+
+  file.write((uint8_t*)&totalLen, 4);
+  file.write(fb->buf, fb->len);
+  
+  if (padding > 0) {
+    uint8_t pad[3] = {0,0,0};
+    file.write(pad, padding);
+  }
+
+  avi_movi_size += (totalLen + 8); 
+  avi_total_frames++;
+}
+
+void endAVI(File &file, int fps, int width, int height) {
+  unsigned long duration = millis() - avi_start_time;
+  float real_fps = (float)avi_total_frames / (duration / 1000.0);
+  if (real_fps <= 0) real_fps = (float)fps;
+  
+  file.seek(0);
+  
+  uint32_t totalSize = file.size();
+  uint32_t riffSize = totalSize - 8;
+  uint32_t microSecPerFrame = (uint32_t)(1000000.0 / real_fps);
+  uint32_t maxBytesPerSec = (width * height * 2) * real_fps; 
+
+  file.write((const uint8_t*)"RIFF", 4);
+  file.write((uint8_t*)&riffSize, 4);
+  file.write((const uint8_t*)"AVI ", 4);
+
+  file.write((const uint8_t*)"LIST", 4);
+  uint32_t hdrlSize = 192; 
+  file.write((uint8_t*)&hdrlSize, 4);
+  file.write((const uint8_t*)"hdrl", 4);
+
+  file.write((const uint8_t*)"avih", 4);
+  uint32_t avihSize = 56;
+  file.write((uint8_t*)&avihSize, 4);
+  
+  file.write((uint8_t*)&microSecPerFrame, 4);
+  uint32_t maxTransferRate = maxBytesPerSec;
+  file.write((uint8_t*)&maxTransferRate, 4); 
+  uint32_t padding = 0;
+  file.write((uint8_t*)&padding, 4); 
+  uint32_t flags = 0;
+  file.write((uint8_t*)&flags, 4);
+  file.write((uint8_t*)&avi_total_frames, 4);
+  file.write((uint8_t*)&padding, 4); 
+  uint32_t streams = 1;
+  file.write((uint8_t*)&streams, 4);
+  uint32_t bufSize = width * height * 2; 
+  file.write((uint8_t*)&bufSize, 4);
+  file.write((uint8_t*)&width, 4);
+  file.write((uint8_t*)&height, 4);
+  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4); 
+
+  file.write((const uint8_t*)"LIST", 4);
+  uint32_t strlSize = 116;
+  file.write((uint8_t*)&strlSize, 4);
+  file.write((const uint8_t*)"strl", 4);
+
+  file.write((const uint8_t*)"strh", 4);
+  uint32_t strhSize = 56;
+  file.write((uint8_t*)&strhSize, 4);
+  file.write((const uint8_t*)"vids", 4); 
+  file.write((const uint8_t*)"MJPG", 4); 
+  file.write((uint8_t*)&flags, 4); 
+  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4); 
+  uint32_t scale = 1;
+  file.write((uint8_t*)&scale, 4);
+  uint32_t rate = (uint32_t)real_fps;
+  if(rate == 0) rate = 10;
+  file.write((uint8_t*)&rate, 4);
+  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&avi_total_frames, 4); 
+  file.write((uint8_t*)&bufSize, 4); 
+  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4); 
+
+  file.write((const uint8_t*)"strf", 4);
+  uint32_t strfSize = 40;
+  file.write((uint8_t*)&strfSize, 4);
+  file.write((uint8_t*)&strfSize, 4); 
+  file.write((uint8_t*)&width, 4);
+  file.write((uint8_t*)&height, 4);
+  uint16_t planes = 1;
+  file.write((uint8_t*)&planes, 2);
+  uint16_t bitCount = 24;
+  file.write((uint8_t*)&bitCount, 2);
+  file.write((const uint8_t*)"MJPG", 4); 
+  uint32_t imageSize = width * height * 3;
+  file.write((uint8_t*)&imageSize, 4);
+  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4); 
+
+  file.write((const uint8_t*)"LIST", 4);
+  file.write((uint8_t*)&avi_movi_size, 4);
+  file.write((const uint8_t*)"movi", 4);
+
+  file.close();
 }
