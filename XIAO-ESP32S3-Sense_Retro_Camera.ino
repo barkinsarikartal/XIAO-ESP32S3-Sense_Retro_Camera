@@ -13,16 +13,18 @@
 #include "freertos/semphr.h"
 
 //   TFT Pin         ->	   XIAO ESP32-S3
-//     VCC           ->	        3V3
+//     VCC           ->	        5V
 //     GND           ->	        GND
+//     CS            ->	       GPIO1
+//    RESET          ->	       GPIO3
+//     A0            ->	       GPIO2
+//     SDA           ->	       GPIO9
 //     SCK           ->	       GPIO7
-//  SDA / MOSI       ->	       GPIO9
-//      CS           ->	       GPIO1
-//      DC           ->	       GPIO2
-//     RST           ->	       GPIO3
 //     LED           ->	        3V3
 
-// SHUTTER BUTTON    ->        GPIO4
+// SHUTTER BUTTON    ->    XIAO ESP32-S3
+//      1            ->        GPIO4
+//      2            ->        GPIO5
 
 // ================= EXTERNAL PINS =================
 #define TFT_CS            1
@@ -31,9 +33,12 @@
 #define TFT_SCK           7
 #define TFT_MISO          8
 #define TFT_MOSI          9
+
 #define BTN_PIN           0  // boot button on XIAO (used for mirroring the image)
 #define SD_CS_PIN         21 // SD card CS pin on XIAO ESP32S3 Sense
-#define SHUTTER_BTN_PIN   4
+
+#define SHUTTER_BTN_PIN_1 4
+#define SHUTTER_BTN_PIN_2 5
 
 // ================= CAM PINS (XIAO ESP32-S3 Sense) =================
 #define PWDN_GPIO_NUM     -1
@@ -144,7 +149,10 @@ void setup() {
   esp_bt_controller_disable();
 
   pinMode(BTN_PIN, INPUT_PULLUP);
-  pinMode(SHUTTER_BTN_PIN, INPUT_PULLUP);
+  pinMode(SHUTTER_BTN_PIN_1, OUTPUT);
+  pinMode(SHUTTER_BTN_PIN_2, INPUT_PULLUP);
+
+  digitalWrite(SHUTTER_BTN_PIN_1, LOW);
 
   sdMutex = xSemaphoreCreateMutex();
   tftMutex = xSemaphoreCreateMutex();
@@ -347,8 +355,8 @@ void taskCamera(void *pvParameters) {
     }
     lastBtn = btnNow;
 
-    int shutterState = digitalRead(SHUTTER_BTN_PIN);
-
+    int shutterState = digitalRead(SHUTTER_BTN_PIN_2);
+    Serial.println(shutterState);
     // capture the moment it's pressed
     if (lastShutterState == HIGH && shutterState == LOW) {
       shutterPressTime = millis();
@@ -406,20 +414,28 @@ void taskCamera(void *pvParameters) {
       fb = NULL;
       
       bool cardReady = false;
+      String errorMsg = "";
       if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100))) {
-        cardReady = (globalSDState.isMounted && !globalSDState.isFull);
+        if (!globalSDState.isMounted) errorMsg = "NO SD CARD!";
+        else if (globalSDState.isFull) errorMsg = "SD FULL!";
+        else cardReady = true;
         xSemaphoreGive(sdMutex);
       }
 
       if(cardReady) {
+        if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
+          tft.fillScreen(TFT_BLACK);
+          xSemaphoreGive(tftMutex);
+        }
         initCamera(VIDEO_MODE, VIDEO_RESOLUTION, REC_JPEG_QUALITY);
         startVideoRecording(); 
         recordingStartTime = millis();
       }
       else {
         if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
+          tft.setCursor(0, 0);
           tft.setTextColor(TFT_RED, TFT_BLACK);
-          tft.drawString("NO SD / FULL", 20, 60);
+          tft.print(errorMsg);
           xSemaphoreGive(tftMutex);
         }
         vTaskDelay(1000);
@@ -437,7 +453,7 @@ void taskCamera(void *pvParameters) {
         if (isRecording) {
           // printing video visuals to the screen
           // this is not working good right now. going to try to fix this later
-          tft.drawJpg(fb->buf, fb->len, 0, 0, 160, 120);
+          tft.drawJpg(fb->buf, fb->len, 20, 16, 0, 0, 0, 0, JPEG_DIV_4);
           // recording icon
           if ((millis() / 500) % 2 == 0) tft.fillCircle(10, 10, 4, TFT_RED);
           else tft.fillCircle(10, 10, 4, TFT_BLACK);
@@ -522,12 +538,14 @@ void savePhotoHighRes() {
   fb = esp_camera_fb_get();
   if(!fb) {
     Serial.println("Cam error!");
-    tft.setCursor(40, 60);
-    tft.print("CAM ERROR");
+    if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
+      tft.setCursor(40, 60);
+      tft.print("CAM ERROR");
+      xSemaphoreGive(tftMutex);
+    }
   }
   else {
     if (xSemaphoreTake(sdMutex, portMAX_DELAY)) {
-      
       if (SD.totalBytes() > 0) {
         String path = "/hd_pic_" + String(pictureNumber) + ".jpg";
         Serial.printf("Saving (%u bytes): %s\n", fb->len, path.c_str());
