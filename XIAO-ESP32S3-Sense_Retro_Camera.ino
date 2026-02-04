@@ -13,7 +13,7 @@
 #include "freertos/semphr.h"
 
 //   TFT Pin         ->	   XIAO ESP32-S3
-//     VCC           ->	        5V
+//     VCC           ->	        3V3
 //     GND           ->	        GND
 //     CS            ->	       GPIO1
 //    RESET          ->	       GPIO3
@@ -162,7 +162,7 @@ void setup() {
 
   // TFT
   tft.init();
-  tft.setRotation(3);
+  tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
 
   tft.setTextDatum(middle_center);
@@ -356,7 +356,6 @@ void taskCamera(void *pvParameters) {
     lastBtn = btnNow;
 
     int shutterState = digitalRead(SHUTTER_BTN_PIN_2);
-    Serial.println(shutterState);
     // capture the moment it's pressed
     if (lastShutterState == HIGH && shutterState == LOW) {
       shutterPressTime = millis();

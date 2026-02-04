@@ -22,7 +22,7 @@ This project is a compact digital camera implementation using the Seeed Studio X
 ## Pin Configuration
 
 <div align="center">
-  <img src="connections.png" width="600" alt="Connection Diagram">
+  <img src="images/connections.png" width="600" alt="Connection Diagram">
   <br><br>
   <table>
     <tr>
@@ -35,7 +35,7 @@ This project is a compact digital camera implementation using the Seeed Studio X
           </tr>
           <tr>
             <td>VCC</td>
-            <td>5V</td>
+            <td>3.3V</td>
           </tr>
           <tr>
             <td>GND</td>
@@ -86,6 +86,25 @@ This project is a compact digital camera implementation using the Seeed Studio X
       </td>
     </tr>
   </table>
+</div>
+
+## Assembly & Battery Power
+
+To make the camera portable, the components were transferred from a breadboard to a soldered perfboard and powered by a rechargeable 3.7V 18650 Li-ion battery.
+
+**Important Power Modification:**
+When the Seeed Studio XIAO ESP32-S3 is powered via the battery pads (or battery connector), the 5V pin on the board does not output voltage. Consequently, the **TFT Display VCC and LED pins must be connected to the 3.3V pin** instead of 5V. The wiring diagram and pin configuration above reflect this change to ensure operation on battery power.
+
+The gallery below demonstrates the soldering steps, wiring logic, and the final handheld assembly:
+
+<div align="center">
+  <img src="images/photo_1.jpg" width="30%" alt="Perfboard Layout">
+  <img src="images/photo_2.jpg" width="30%" alt="Wiring Back">
+  <img src="images/photo_3.jpg" width="30%" alt="Battery Connection">
+  <br>
+  <img src="images/photo_4.jpg" width="30%" alt="Power Soldering">
+  <img src="images/photo_5.jpg" width="30%" alt="Front Assembly">
+  <img src="images/photo_6.jpg" width="30%" alt="Side View">
 </div>
 
 ## Installation
