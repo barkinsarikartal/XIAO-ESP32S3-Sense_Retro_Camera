@@ -61,7 +61,8 @@
 
 // ================= EEPROM SETTINGS =================
 #define EEPROM_SIZE       64
-#define EEPROM_ADDR       0
+#define EEPROM_ADDR_PIC   0
+#define EEPROM_ADDR_VID   4
 
 // ================= CAMERA SETTINGS =================
 #define PHOTO_MODE        PIXFORMAT_JPEG
@@ -85,6 +86,7 @@ struct SDStatus {
 
 SDStatus globalSDState = {false, false, "NO CARD"};
 int pictureNumber = 0;
+int videoNumber = 0;
 bool mirror = true;
 
 bool isRecording = false;
@@ -176,14 +178,23 @@ void setup() {
   tft.setTextDatum(top_left);
 
   EEPROM.begin(EEPROM_SIZE);
-  pictureNumber = EEPROM.readInt(EEPROM_ADDR);
 
+  pictureNumber = EEPROM.readInt(EEPROM_ADDR_PIC);
   if (pictureNumber < 0 || pictureNumber > 10000) {
     pictureNumber = 0;
-    EEPROM.writeInt(EEPROM_ADDR, pictureNumber);
-    EEPROM.commit();
+    EEPROM.writeInt(EEPROM_ADDR_PIC, pictureNumber);
   }
-  Serial.printf("Initial image no: %d\n", pictureNumber);
+
+  videoNumber = EEPROM.readInt(EEPROM_ADDR_VID);
+  Serial.printf("Initial video no: %d\n", videoNumber);
+  if (videoNumber < 0 || videoNumber > 10000) {
+    videoNumber = 0;
+    EEPROM.writeInt(EEPROM_ADDR_VID, videoNumber);
+  }
+
+  EEPROM.commit();
+
+  Serial.printf("Initial image no: %d, video no: %d\n", pictureNumber, videoNumber);
 
   // CAMERA CONFIG
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -327,7 +338,7 @@ void taskCamera(void *pvParameters) {
             tft.drawString("REC SAVED (ERR)", 10, 80);
             xSemaphoreGive(tftMutex);
           }
-          delay(1000);
+          delay(200);
         }
 
         if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
@@ -556,15 +567,15 @@ void savePhotoHighRes() {
           Serial.println("SUCCESS!");
           
           pictureNumber++;
-          EEPROM.writeInt(EEPROM_ADDR, pictureNumber);
+          EEPROM.writeInt(EEPROM_ADDR_PIC, pictureNumber);
           EEPROM.commit();
 
           if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
             tft.fillRoundRect(30, 50, 100, 30, 5, TFT_WHITE);
             tft.drawRoundRect(30, 50, 100, 30, 5, TFT_BLACK);
             tft.setTextColor(TFT_BLACK);
-            tft.setCursor(45, 60);
-            tft.print("SAVED #" + String(pictureNumber-1));
+            tft.setCursor(40, 60);
+            tft.print("PIC SAVED #" + String(pictureNumber-1));
             xSemaphoreGive(tftMutex);
           }
         }
@@ -641,14 +652,14 @@ void initCamera(pixformat_t format, framesize_t size, int jpeg_quality) {
 
 void startVideoRecording() {
   if (xSemaphoreTake(sdMutex, portMAX_DELAY)) {
-    String path = "/vid_" + String(pictureNumber) + ".avi"; 
+    String path = "/vid_" + String(videoNumber) + ".avi"; 
     Serial.printf("Video Start: %s\n", path.c_str());
     
     videoFile = SD.open(path.c_str(), FILE_WRITE);
     if (videoFile) {
       isRecording = true;
-      pictureNumber++;
-      EEPROM.writeInt(EEPROM_ADDR, pictureNumber);
+      videoNumber++;
+      EEPROM.writeInt(EEPROM_ADDR_VID, videoNumber);
       EEPROM.commit();
       
       startAVI(videoFile, 10, 240, 176); 
@@ -667,9 +678,16 @@ void stopVideoRecording() {
       Serial.println("Video Saved.");
       
       if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
-        tft.fillScreen(TFT_GREEN);
+        tft.fillRoundRect(30, 50, 100, 30, 5, TFT_WHITE);
+        tft.drawRoundRect(30, 50, 100, 30, 5, TFT_BLACK);
         tft.setTextColor(TFT_BLACK);
-        tft.drawString("VIDEO SAVED", 30, 60);
+        tft.setCursor(40, 60);
+        tft.print("VIDEO SAVED #" + String(videoNumber-1));
+
+        // tft.fillScreen(TFT_GREEN);
+        // tft.setTextColor(TFT_BLACK);
+        // tft.setCursor(30, 60);
+        // tft.print("VIDEO SAVED #" + String(videoNumber-1));
         xSemaphoreGive(tftMutex);
       }
       delay(1000);
