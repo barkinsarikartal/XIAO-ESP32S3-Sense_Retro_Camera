@@ -99,11 +99,13 @@ SemaphoreHandle_t tftMutex; // to prevent typing on the screen simultaneously
 camera_config_t config;
 
 // ================= AVI HEADER VARIABLES =================
-const int avi_header_size = 252; 
+const int avi_header_size = 224; 
 long avi_movi_size = 0;
 long avi_index_size = 0;
 unsigned long avi_start_time = 0;
 int avi_total_frames = 0;
+uint32_t *avi_frame_sizes = nullptr;  // allocated in PSRAM (not internal RAM)
+int avi_frame_capacity = 0;
 
 // ================= TFT CLASS =================
 class LGFX : public lgfx::LGFX_Device {
@@ -464,9 +466,21 @@ void taskCamera(void *pvParameters) {
           // printing video visuals to the screen
           // this is not working good right now. going to try to fix this later
           tft.drawJpg(fb->buf, fb->len, 20, 16, 0, 0, 0, 0, JPEG_DIV_4);
-          // recording icon
+
+          // recording icon (blinking)
           if ((millis() / 500) % 2 == 0) tft.fillCircle(10, 10, 4, TFT_RED);
           else tft.fillCircle(10, 10, 4, TFT_BLACK);
+
+          // displaying recording duration (hh:mm:ss)
+          unsigned long elapsed = (millis() - recordingStartTime) / 1000;
+          int hours = elapsed / 3600;
+          int minutes = (elapsed % 3600) / 60;
+          int seconds = elapsed % 60;
+          char timeStr[12];
+          sprintf(timeStr, "%02d:%02d:%02d", hours, minutes, seconds);
+          tft.setTextColor(TFT_WHITE, TFT_BLACK);
+          tft.setCursor(20, 4);
+          tft.print(timeStr);
         }
         else {
           // printing what the cam sees to the screen when no photos or videos are being taken
@@ -702,6 +716,14 @@ void startAVI(File &file, int fps, int width, int height) {
   avi_total_frames = 0;
   avi_start_time = millis();
   
+  // Allocate frame size array in PSRAM
+  if (avi_frame_sizes) {
+    free(avi_frame_sizes);
+    avi_frame_sizes = nullptr;
+  }
+  avi_frame_capacity = 36000;  // 1 hour at 10fps
+  avi_frame_sizes = (uint32_t*)ps_malloc(avi_frame_capacity * sizeof(uint32_t));
+  
   uint8_t zero_buf[avi_header_size];
   memset(zero_buf, 0, avi_header_size);
   file.write(zero_buf, avi_header_size);
@@ -724,7 +746,10 @@ void writeAVIFrame(File &file, camera_fb_t *fb) {
     file.write(pad, padding);
   }
 
-  avi_movi_size += (totalLen + 8); 
+  avi_movi_size += (totalLen + 8);
+  if (avi_frame_sizes && avi_total_frames < avi_frame_capacity) {
+    avi_frame_sizes[avi_total_frames] = totalLen;
+  }
   avi_total_frames++;
 }
 
@@ -732,7 +757,25 @@ void endAVI(File &file, int fps, int width, int height) {
   unsigned long duration = millis() - avi_start_time;
   float real_fps = (float)avi_total_frames / (duration / 1000.0);
   if (real_fps <= 0) real_fps = (float)fps;
+
+  //  step 1: write idx1 at end of file
+  file.seek(0, SeekEnd);
+  file.write((const uint8_t*)"idx1", 4);
+  uint32_t idx1Size = avi_total_frames * 16;
+  file.write((uint8_t*)&idx1Size, 4);
   
+  uint32_t frameOffset = 4;  // offset from "movi" tag
+  for (int i = 0; i < avi_total_frames; i++) {
+    uint32_t frameSize = (avi_frame_sizes && i < avi_frame_capacity) ? avi_frame_sizes[i] : 0;
+    file.write((const uint8_t*)"00dc", 4);
+    uint32_t kf = 0x10;  // AVIIF_KEYFRAME
+    file.write((uint8_t*)&kf, 4);
+    file.write((uint8_t*)&frameOffset, 4);
+    file.write((uint8_t*)&frameSize, 4);
+    frameOffset += frameSize + 8;
+  }
+  
+  // step 2: rewrite header at position 0
   file.seek(0);
   
   uint32_t totalSize = file.size();
@@ -758,8 +801,8 @@ void endAVI(File &file, int fps, int width, int height) {
   file.write((uint8_t*)&maxTransferRate, 4); 
   uint32_t padding = 0;
   file.write((uint8_t*)&padding, 4); 
-  uint32_t flags = 0;
-  file.write((uint8_t*)&flags, 4);
+  uint32_t avih_flags = 0x10;  // AVIF_HASINDEX
+  file.write((uint8_t*)&avih_flags, 4);
   file.write((uint8_t*)&avi_total_frames, 4);
   file.write((uint8_t*)&padding, 4); 
   uint32_t streams = 1;
@@ -783,7 +826,7 @@ void endAVI(File &file, int fps, int width, int height) {
   file.write((uint8_t*)&strhSize, 4);
   file.write((const uint8_t*)"vids", 4); 
   file.write((const uint8_t*)"MJPG", 4); 
-  file.write((uint8_t*)&flags, 4); 
+  file.write((uint8_t*)&padding, 4);  
   file.write((uint8_t*)&padding, 4); 
   file.write((uint8_t*)&padding, 4); 
   uint32_t scale = 1;
@@ -818,8 +861,15 @@ void endAVI(File &file, int fps, int width, int height) {
   file.write((uint8_t*)&padding, 4); 
 
   file.write((const uint8_t*)"LIST", 4);
-  file.write((uint8_t*)&avi_movi_size, 4);
+  uint32_t moviListSize = 4 + avi_movi_size;
+  file.write((uint8_t*)&moviListSize, 4);
   file.write((const uint8_t*)"movi", 4);
+
+  if (avi_frame_sizes) {
+    free(avi_frame_sizes);
+    avi_frame_sizes = nullptr;
+  }
+  avi_frame_capacity = 0;
 
   file.close();
 }
