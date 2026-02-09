@@ -90,6 +90,7 @@ int videoNumber = 0;
 bool mirror = true;
 
 bool isRecording = false;
+volatile bool stopRecordingRequested = false;
 unsigned long recordingStartTime = 0;
 File videoFile;
 
@@ -143,6 +144,17 @@ public:
 };
 
 LGFX tft;
+
+// ================= FUNCTION PROTOTYPES =================
+void taskSDMonitor(void *pvParameters);
+void taskCamera(void *pvParameters);
+void savePhotoHighRes();
+void initCamera(pixformat_t format, framesize_t size, int jpeg_quality);
+void startVideoRecording();
+void stopVideoRecording(bool showSavedMsg = true);
+void startAVI(File &file, int fps, int width, int height);
+bool writeAVIFrame(File &file, camera_fb_t *fb);
+void endAVI(File &file, int fps, int width, int height);
 
 // ================= SETUP =================
 void setup() {
@@ -261,8 +273,25 @@ void taskSDMonitor(void *pvParameters) {
   while (true) {
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
 
-      // do not occupy the SD card during recording
+      // during recording: only check free space, skip heavy operations
       if(isRecording) {
+        bool shouldStop = false;
+        if (SD.cardType() == CARD_NONE || SD.totalBytes() == 0) {
+          shouldStop = true;
+          Serial.println("SD card removed during recording!");
+        }
+        else {
+          uint64_t freeBytes = SD.totalBytes() - SD.usedBytes();
+          Serial.println("Free space during recording: " + String(freeBytes / 1024) + " KB");
+          // send signal to stop recording if less than 10MB space remains
+          if (freeBytes < 10 * 1024 * 1024) {
+            shouldStop = true;
+            Serial.println("SD card nearly full during recording!");
+          }
+        }
+        if (shouldStop) {
+          stopRecordingRequested = true;
+        }
         xSemaphoreGive(sdMutex);
         vTaskDelay(2000);
         continue;
@@ -293,8 +322,8 @@ void taskSDMonitor(void *pvParameters) {
         uint64_t used = SD.usedBytes();
         uint64_t free = total - used;
         
-        // if less than 200KB of space remains, consider it full.
-        if (free < 200 * 1024) { 
+        // if less than 10MB of space remains, consider it full.
+        if (free < 10 * 1024 * 1024) { 
           currentFull = true;
           msg = "SD FULL";
         }
@@ -334,7 +363,7 @@ void taskCamera(void *pvParameters) {
       Serial.printf("Cam Fail: %d\n", fail_count);
       if (fail_count > 10) {
         if (isRecording) {
-          stopVideoRecording(); 
+          stopVideoRecording(false); 
           if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
             tft.setTextColor(TFT_ORANGE, TFT_BLACK);
             tft.drawString("REC SAVED (ERR)", 10, 80);
@@ -495,9 +524,48 @@ void taskCamera(void *pvParameters) {
 
     // video recording
     if (isRecording && fb->format == PIXFORMAT_JPEG) {
+      // check if SD monitor requested a stop (SD full or removed)
+      if (stopRecordingRequested) {
+        stopRecordingRequested = false;
+        esp_camera_fb_return(fb);
+        fb = NULL;
+        stopVideoRecording(false);
+        if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
+          tft.fillScreen(TFT_BLACK);
+          tft.setTextColor(TFT_RED);
+          tft.setCursor(10, 50);
+          tft.print("REC STOPPED");
+          tft.setCursor(10, 70);
+          tft.print(globalSDState.isMounted ? "SD FULL!" : "SD REMOVED!");
+          xSemaphoreGive(tftMutex);
+        }
+        delay(2000);
+        initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
+        continue;
+      }
+
       if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(50))) {
         if (videoFile) {
-          writeAVIFrame(videoFile, fb);
+          bool ok = writeAVIFrame(videoFile, fb);
+          if (!ok) {
+            Serial.println("Write error! Stopping recording.");
+            xSemaphoreGive(sdMutex);
+            esp_camera_fb_return(fb);
+            fb = NULL;
+            stopVideoRecording(false);
+            if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
+              tft.fillScreen(TFT_BLACK);
+              tft.setTextColor(TFT_RED);
+              tft.setCursor(10, 50);
+              tft.print("WRITE ERROR!");
+              tft.setCursor(10, 70);
+              tft.print("REC STOPPED");
+              xSemaphoreGive(tftMutex);
+            }
+            delay(2000);
+            initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
+            continue;
+          }
         }
         xSemaphoreGive(sdMutex);
       }
@@ -685,26 +753,31 @@ void startVideoRecording() {
   }
 }
 
-void stopVideoRecording() {
+void stopVideoRecording(bool showSavedMsg) {
   if (xSemaphoreTake(sdMutex, portMAX_DELAY)) {
     if (videoFile) {
       endAVI(videoFile, 10, 240, 176); 
-      Serial.println("Video Saved.");
       
-      if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
-        tft.fillRoundRect(30, 50, 100, 30, 5, TFT_WHITE);
-        tft.drawRoundRect(30, 50, 100, 30, 5, TFT_BLACK);
-        tft.setTextColor(TFT_BLACK);
-        tft.setCursor(40, 60);
-        tft.print("VIDEO SAVED #" + String(videoNumber-1));
+      if (showSavedMsg) {
+        Serial.println("Video Saved.");
+        if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
+          tft.fillRoundRect(30, 50, 100, 30, 5, TFT_WHITE);
+          tft.drawRoundRect(30, 50, 100, 30, 5, TFT_BLACK);
+          tft.setTextColor(TFT_BLACK);
+          tft.setCursor(40, 60);
+          tft.print("VIDEO SAVED #" + String(videoNumber-1));
 
-        // tft.fillScreen(TFT_GREEN);
-        // tft.setTextColor(TFT_BLACK);
-        // tft.setCursor(30, 60);
-        // tft.print("VIDEO SAVED #" + String(videoNumber-1));
-        xSemaphoreGive(tftMutex);
+          // tft.fillScreen(TFT_GREEN);
+          // tft.setTextColor(TFT_BLACK);
+          // tft.setCursor(30, 60);
+          // tft.print("VIDEO SAVED #" + String(videoNumber-1));
+          xSemaphoreGive(tftMutex);
+        }
+        delay(1000);
       }
-      delay(1000);
+      else {
+        Serial.println("Recording stopped (error).");
+      }
     }
     isRecording = false;
     xSemaphoreGive(sdMutex);
@@ -729,28 +802,34 @@ void startAVI(File &file, int fps, int width, int height) {
   file.write(zero_buf, avi_header_size);
 }
 
-void writeAVIFrame(File &file, camera_fb_t *fb) {
+bool writeAVIFrame(File &file, camera_fb_t *fb) {
   uint8_t dc_buf[4] = {0x30, 0x30, 0x64, 0x63}; 
-  file.write(dc_buf, 4);
+  size_t w1 = file.write(dc_buf, 4);
 
   uint32_t len = fb->len;
   uint32_t rem = len % 4;
   uint32_t padding = (rem == 0) ? 0 : 4 - rem;
   uint32_t totalLen = len + padding;
 
-  file.write((uint8_t*)&totalLen, 4);
-  file.write(fb->buf, fb->len);
+  size_t w2 = file.write((uint8_t*)&totalLen, 4);
+  size_t w3 = file.write(fb->buf, fb->len);
   
   if (padding > 0) {
     uint8_t pad[3] = {0,0,0};
     file.write(pad, padding);
   }
 
-  avi_movi_size += (totalLen + 8);
+  // check if writes succeeded
+  if (w1 != 4 || w2 != 4 || w3 != fb->len) {
+    return false;
+  }
+
+  avi_movi_size += (totalLen + 8); 
   if (avi_frame_sizes && avi_total_frames < avi_frame_capacity) {
     avi_frame_sizes[avi_total_frames] = totalLen;
   }
   avi_total_frames++;
+  return true;
 }
 
 void endAVI(File &file, int fps, int width, int height) {
@@ -758,7 +837,7 @@ void endAVI(File &file, int fps, int width, int height) {
   float real_fps = (float)avi_total_frames / (duration / 1000.0);
   if (real_fps <= 0) real_fps = (float)fps;
 
-  //  step 1: write idx1 at end of file
+  // step 1: write idx1 at end of file
   file.seek(0, SeekEnd);
   file.write((const uint8_t*)"idx1", 4);
   uint32_t idx1Size = avi_total_frames * 16;
@@ -774,7 +853,7 @@ void endAVI(File &file, int fps, int width, int height) {
     file.write((uint8_t*)&frameSize, 4);
     frameOffset += frameSize + 8;
   }
-  
+
   // step 2: rewrite header at position 0
   file.seek(0);
   
