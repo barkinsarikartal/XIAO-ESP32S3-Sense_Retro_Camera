@@ -100,18 +100,6 @@ To create a portable retro camera, components are soldered onto a perfboard and 
 **Important Power Requirement:**
 When the Seeed Studio XIAO ESP32-S3 is powered via the battery connector, the 5V output is disabled. Therefore, the **TFT Display VCC and LED pins must be connected to the 3.3V pin** instead of 5V to ensure proper operation on battery power.
 
-The gallery below demonstrates the soldering steps, wiring logic, and the final handheld assembly:
-
-<div align="center">
-  <img src="images/photo_1.jpg" width="30%" alt="Perfboard Layout">
-  <img src="images/photo_2.jpg" width="30%" alt="Wiring Back">
-  <img src="images/photo_3.jpg" width="30%" alt="Battery Connection">
-  <br>
-  <img src="images/photo_4.jpg" width="30%" alt="Power Soldering">
-  <img src="images/photo_5.jpg" width="30%" alt="Front Assembly">
-  <img src="images/photo_6.jpg" width="30%" alt="Side View">
-</div>
-
 ## Installation & Setup
 
 ### PlatformIO Installation (Recommended)
