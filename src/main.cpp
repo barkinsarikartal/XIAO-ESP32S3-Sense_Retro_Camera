@@ -72,7 +72,7 @@
 #define VIDEO_RESOLUTION  FRAMESIZE_HVGA
 
 #define IDLE_MODE         PIXFORMAT_RGB565
-#define IDLE_RESOLUTION   FRAMESIZE_QQVGA
+#define IDLE_RESOLUTION   FRAMESIZE_QVGA
 
 #define REC_JPEG_QUALITY  12
 #define IDLE_JPEG_QUALITY 0
@@ -110,7 +110,7 @@ int avi_frame_capacity = 0;
 
 // ================= TFT CLASS =================
 class LGFX : public lgfx::LGFX_Device {
-  lgfx::Panel_ST7735S _panel;
+  lgfx::Panel_ST7789 _panel;
   lgfx::Bus_SPI _bus;
 
 public:
@@ -118,7 +118,7 @@ public:
     auto bcfg = _bus.config();
     bcfg.spi_host = SPI2_HOST;
     bcfg.spi_mode = 0;
-    bcfg.freq_write = 40000000; // 40 MHz
+    bcfg.freq_write = 80000000; // 80 MHz
     bcfg.pin_sclk = TFT_SCK;
     bcfg.pin_mosi = TFT_MOSI;
     bcfg.pin_miso = TFT_MISO;
@@ -129,12 +129,12 @@ public:
     auto pcfg = _panel.config();
     pcfg.pin_cs = TFT_CS;
     pcfg.pin_rst = TFT_RST;
-    pcfg.panel_width  = 128;
-    pcfg.panel_height = 160;
+    pcfg.panel_width  = 240;
+    pcfg.panel_height = 320;
     pcfg.offset_x = 0;
     pcfg.offset_y = 0;
-    pcfg.invert = false;
-    pcfg.rgb_order = true;
+    pcfg.invert = true;
+    pcfg.rgb_order = false;
     pcfg.readable = false;
 
     _panel.config(pcfg);
@@ -183,12 +183,12 @@ void setup() {
 
   tft.setTextDatum(middle_center);
   tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(3);
+  tft.drawString("GETTING READY", tft.width() / 2, 75);
+  tft.setTextSize(3);
+  tft.drawString("PLEASE WAIT..", tft.width() / 2, 115);
   tft.setTextSize(2);
-  tft.drawString("GETTING READY", tft.width() / 2, 40);
-  tft.setTextSize(2);
-  tft.drawString("PLEASE WAIT..", tft.width() / 2, 70);
-  tft.setTextSize(1);
-  tft.drawString("github@barkinsarikartal", tft.width() / 2, 110); // mini ad here :)
+  tft.drawString("github@barkinsarikartal", tft.width() / 2, 200); // mini ad here :)
   tft.setTextDatum(top_left);
 
   EEPROM.begin(EEPROM_SIZE);
@@ -365,8 +365,9 @@ void taskCamera(void *pvParameters) {
         if (isRecording) {
           stopVideoRecording(false); 
           if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
+            tft.setTextSize(2);
             tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-            tft.drawString("REC SAVED (ERR)", 10, 80);
+            tft.drawString("REC SAVED (ERR)", 20, 140);
             xSemaphoreGive(tftMutex);
           }
           delay(200);
@@ -374,7 +375,8 @@ void taskCamera(void *pvParameters) {
 
         if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
           tft.fillScreen(TFT_RED);
-          tft.drawString("CAM RESET...", 10, 60);
+          tft.setTextSize(2);
+          tft.drawString("CAM RESET...", 20, 110);
           xSemaphoreGive(tftMutex);
         }
         delay(100);
@@ -422,7 +424,8 @@ void taskCamera(void *pvParameters) {
 
         if (!canSave) {
           if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
-            tft.setCursor(0, 0);
+            tft.setTextSize(2);
+            tft.setCursor(10, 10);
             tft.setTextColor(TFT_RED, TFT_BLACK);
             tft.print(errMsg);
             xSemaphoreGive(tftMutex);
@@ -474,7 +477,8 @@ void taskCamera(void *pvParameters) {
       }
       else {
         if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
-          tft.setCursor(0, 0);
+          tft.setTextSize(2);
+          tft.setCursor(10, 10);
           tft.setTextColor(TFT_RED, TFT_BLACK);
           tft.print(errorMsg);
           xSemaphoreGive(tftMutex);
@@ -494,11 +498,11 @@ void taskCamera(void *pvParameters) {
         if (isRecording) {
           // printing video visuals to the screen
           // this is not working good right now. going to try to fix this later
-          tft.drawJpg(fb->buf, fb->len, 20, 16, 0, 0, 0, 0, JPEG_DIV_4);
+          tft.drawJpg(fb->buf, fb->len, 40, 32, 0, 0, 0, 0, JPEG_DIV_2);
 
           // recording icon (blinking)
-          if ((millis() / 500) % 2 == 0) tft.fillCircle(10, 10, 4, TFT_RED);
-          else tft.fillCircle(10, 10, 4, TFT_BLACK);
+          if ((millis() / 500) % 2 == 0) tft.fillCircle(16, 16, 6, TFT_RED);
+          else tft.fillCircle(16, 16, 6, TFT_BLACK);
 
           // displaying recording duration (hh:mm:ss)
           unsigned long elapsed = (millis() - recordingStartTime) / 1000;
@@ -507,14 +511,15 @@ void taskCamera(void *pvParameters) {
           int seconds = elapsed % 60;
           char timeStr[12];
           sprintf(timeStr, "%02d:%02d:%02d", hours, minutes, seconds);
+          tft.setTextSize(2);
           tft.setTextColor(TFT_WHITE, TFT_BLACK);
-          tft.setCursor(20, 4);
+          tft.setCursor(30, 6);
           tft.print(timeStr);
         }
         else {
           // printing what the cam sees to the screen when no photos or videos are being taken
-          for (int y = 0; y < 112; y++) { // displaying 160x112 pixels. last 16 pixel row is for FPS indicator.
-            tft.pushImage(0, y, 160, 1, (uint16_t *)(fb->buf + y * 160 * 2));
+          for (int y = 0; y < 216; y++) { // displaying 320x216 pixels. last 24 pixel rows are for status bar.
+            tft.pushImage(0, y, 320, 1, (uint16_t *)(fb->buf + y * 320 * 2));
           }
         }
       }
@@ -532,10 +537,11 @@ void taskCamera(void *pvParameters) {
         stopVideoRecording(false);
         if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
           tft.fillScreen(TFT_BLACK);
+          tft.setTextSize(2);
           tft.setTextColor(TFT_RED);
-          tft.setCursor(10, 50);
+          tft.setCursor(20, 90);
           tft.print("REC STOPPED");
-          tft.setCursor(10, 70);
+          tft.setCursor(20, 120);
           tft.print(globalSDState.isMounted ? "SD FULL!" : "SD REMOVED!");
           xSemaphoreGive(tftMutex);
         }
@@ -555,10 +561,11 @@ void taskCamera(void *pvParameters) {
             stopVideoRecording(false);
             if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
               tft.fillScreen(TFT_BLACK);
+              tft.setTextSize(2);
               tft.setTextColor(TFT_RED);
-              tft.setCursor(10, 50);
+              tft.setCursor(20, 90);
               tft.print("WRITE ERROR!");
-              tft.setCursor(10, 70);
+              tft.setCursor(20, 120);
               tft.print("REC STOPPED");
               xSemaphoreGive(tftMutex);
             }
@@ -580,17 +587,18 @@ void taskCamera(void *pvParameters) {
       fps = frame_count * 1000.0 / (now - last_fps_time);
       
       if (xSemaphoreTake(tftMutex, 10)) {
-        tft.fillRect(0, 112, 160, 16, TFT_BLACK);
+        tft.fillRect(0, 216, 320, 24, TFT_BLACK);
         
-        tft.setCursor(4, 116);
+        tft.setTextSize(2);
+        tft.setCursor(8, 220);
         tft.setTextColor(TFT_GREEN);
         tft.printf("FPS: %.1f", fps);
 
         if (globalSDState.isMounted && !globalSDState.isFull) {
-          tft.fillCircle(150, 120, 3, TFT_GREEN);
+          tft.fillCircle(304, 228, 5, TFT_GREEN);
         }
         else {
-          tft.fillCircle(150, 120, 3, TFT_RED);
+          tft.fillCircle(304, 228, 5, TFT_RED);
         }
 
         xSemaphoreGive(tftMutex);
@@ -607,10 +615,11 @@ void taskCamera(void *pvParameters) {
 void savePhotoHighRes() {
   if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
     digitalWrite(TFT_CS, HIGH);
-    tft.fillRoundRect(30, 50, 100, 30, 5, TFT_BLUE);
-    tft.drawRoundRect(30, 50, 100, 30, 5, TFT_WHITE);
+    tft.fillRoundRect(60, 85, 200, 50, 8, TFT_BLUE);
+    tft.drawRoundRect(60, 85, 200, 50, 8, TFT_WHITE);
+    tft.setTextSize(2);
     tft.setTextColor(TFT_WHITE);
-    tft.setCursor(40, 60);
+    tft.setCursor(95, 102);
     tft.print("HOLD ON...");
     xSemaphoreGive(tftMutex);
   }
@@ -631,7 +640,8 @@ void savePhotoHighRes() {
   if(!fb) {
     Serial.println("Cam error!");
     if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
-      tft.setCursor(40, 60);
+      tft.setTextSize(2);
+      tft.setCursor(95, 102);
       tft.print("CAM ERROR");
       xSemaphoreGive(tftMutex);
     }
@@ -653,10 +663,11 @@ void savePhotoHighRes() {
           EEPROM.commit();
 
           if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
-            tft.fillRoundRect(30, 50, 100, 30, 5, TFT_WHITE);
-            tft.drawRoundRect(30, 50, 100, 30, 5, TFT_BLACK);
+            tft.fillRoundRect(60, 85, 200, 50, 8, TFT_WHITE);
+            tft.drawRoundRect(60, 85, 200, 50, 8, TFT_BLACK);
+            tft.setTextSize(2);
             tft.setTextColor(TFT_BLACK);
-            tft.setCursor(40, 60);
+            tft.setCursor(75, 102);
             tft.print("PIC SAVED #" + String(pictureNumber-1));
             xSemaphoreGive(tftMutex);
           }
@@ -664,7 +675,8 @@ void savePhotoHighRes() {
         else {
           Serial.println("File Open Error");
           if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
-            tft.setCursor(0, 0);
+            tft.setTextSize(2);
+            tft.setCursor(10, 10);
             tft.setTextColor(TFT_RED, TFT_BLACK);
             tft.print("WRITE ERROR");
             xSemaphoreGive(tftMutex);
@@ -674,7 +686,8 @@ void savePhotoHighRes() {
       else {
         Serial.println("SD Lost during capture");
         if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
-          tft.setCursor(0, 0);
+          tft.setTextSize(2);
+          tft.setCursor(10, 10);
           tft.setTextColor(TFT_RED, TFT_BLACK);
           tft.print("SD CONNECTION LOST");
           xSemaphoreGive(tftMutex);
@@ -744,7 +757,7 @@ void startVideoRecording() {
       EEPROM.writeInt(EEPROM_ADDR_VID, videoNumber);
       EEPROM.commit();
       
-      startAVI(videoFile, 10, 240, 176); 
+      startAVI(videoFile, 10, 480, 320); 
     }
     else {
       Serial.println("Video file create failed");
@@ -756,15 +769,16 @@ void startVideoRecording() {
 void stopVideoRecording(bool showSavedMsg) {
   if (xSemaphoreTake(sdMutex, portMAX_DELAY)) {
     if (videoFile) {
-      endAVI(videoFile, 10, 240, 176); 
+      endAVI(videoFile, 10, 480, 320); 
       
       if (showSavedMsg) {
         Serial.println("Video Saved.");
         if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
-          tft.fillRoundRect(30, 50, 100, 30, 5, TFT_WHITE);
-          tft.drawRoundRect(30, 50, 100, 30, 5, TFT_BLACK);
+          tft.fillRoundRect(60, 85, 200, 50, 8, TFT_WHITE);
+          tft.drawRoundRect(60, 85, 200, 50, 8, TFT_BLACK);
+          tft.setTextSize(2);
           tft.setTextColor(TFT_BLACK);
-          tft.setCursor(40, 60);
+          tft.setCursor(68, 102);
           tft.print("VIDEO SAVED #" + String(videoNumber-1));
 
           // tft.fillScreen(TFT_GREEN);
