@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "driver/i2s_pdm.h"
 
 //   TFT Pin         ->	   XIAO ESP32-S3
 //     VCC           ->	        3V3
@@ -39,6 +40,10 @@
 
 #define SHUTTER_BTN_PIN_1 4
 #define SHUTTER_BTN_PIN_2 5
+
+// ================= MIC PINS (XIAO ESP32-S3 Sense built-in PDM) =================
+#define I2S_MIC_CLK_PIN   42
+#define I2S_MIC_DATA_PIN  41
 
 // ================= CAM PINS (XIAO ESP32-S3 Sense) =================
 #define PWDN_GPIO_NUM     -1
@@ -77,6 +82,10 @@
 #define REC_JPEG_QUALITY  12
 #define IDLE_JPEG_QUALITY 0
 
+// ================= AUDIO SETTINGS =================
+#define AUDIO_SAMPLE_RATE   16000
+#define AUDIO_REC_BUF_SIZE  8192
+
 // ================= STRUCTS & GLOBALS =================
 struct SDStatus {
   bool isMounted;     // is the card inserted and mounted
@@ -100,13 +109,18 @@ SemaphoreHandle_t tftMutex; // to prevent typing on the screen simultaneously
 camera_config_t config;
 
 // ================= AVI HEADER VARIABLES =================
-const int avi_header_size = 224; 
+const int avi_header_size = 324; 
 long avi_movi_size = 0;
 long avi_index_size = 0;
 unsigned long avi_start_time = 0;
 int avi_total_frames = 0;
 uint32_t *avi_frame_sizes = nullptr;  // allocated in PSRAM (not internal RAM)
 int avi_frame_capacity = 0;
+uint32_t *avi_audio_sizes = nullptr;
+int avi_total_audio_chunks = 0;
+
+i2s_chan_handle_t i2s_rx_handle = NULL;
+int16_t *audio_rec_buf = nullptr;
 
 // ================= TFT CLASS =================
 class LGFX : public lgfx::LGFX_Device {
@@ -154,7 +168,10 @@ void startVideoRecording();
 void stopVideoRecording(bool showSavedMsg = true);
 void startAVI(File &file, int fps, int width, int height);
 bool writeAVIFrame(File &file, camera_fb_t *fb);
+bool writeAVIAudioChunk(File &file, uint8_t *buf, size_t bytes);
 void endAVI(File &file, int fps, int width, int height);
+void initMicrophone();
+void deinitMicrophone();
 
 // ================= SETUP =================
 void setup() {
@@ -363,7 +380,8 @@ void taskCamera(void *pvParameters) {
       Serial.printf("Cam Fail: %d\n", fail_count);
       if (fail_count > 10) {
         if (isRecording) {
-          stopVideoRecording(false); 
+          stopVideoRecording(false);
+          Serial.println("Cam error! Stopping recording.");
           if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
             tft.setTextSize(2);
             tft.setTextColor(TFT_ORANGE, TFT_BLACK);
@@ -444,6 +462,7 @@ void taskCamera(void *pvParameters) {
       else if (isRecording) {
         if (millis() - recordingStartTime > 2000) {
           stopVideoRecording();
+          Serial.println("Stopping recording.");
           esp_camera_fb_return(fb);
           fb = NULL;
           initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY); // back to normal mode
@@ -535,6 +554,7 @@ void taskCamera(void *pvParameters) {
         esp_camera_fb_return(fb);
         fb = NULL;
         stopVideoRecording(false);
+        Serial.println("Stopping recording.");
         if (xSemaphoreTake(tftMutex, portMAX_DELAY)) {
           tft.fillScreen(TFT_BLACK);
           tft.setTextSize(2);
@@ -550,9 +570,18 @@ void taskCamera(void *pvParameters) {
         continue;
       }
 
+      // Read audio from microphone (non-blocking)
+      size_t audio_bytes_read = 0;
+      if (i2s_rx_handle && audio_rec_buf) {
+        i2s_channel_read(i2s_rx_handle, audio_rec_buf, AUDIO_REC_BUF_SIZE, &audio_bytes_read, 0);
+      }
+
       if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(50))) {
         if (videoFile) {
           bool ok = writeAVIFrame(videoFile, fb);
+          if (ok && audio_bytes_read > 0) {
+            writeAVIAudioChunk(videoFile, (uint8_t*)audio_rec_buf, audio_bytes_read);
+          }
           if (!ok) {
             Serial.println("Write error! Stopping recording.");
             xSemaphoreGive(sdMutex);
@@ -745,6 +774,48 @@ void initCamera(pixformat_t format, framesize_t size, int jpeg_quality) {
   delay(100);
 }
 
+void initMicrophone() {
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  chan_cfg.dma_desc_num = 8;
+  chan_cfg.dma_frame_num = 512;
+  chan_cfg.auto_clear = true;
+
+  esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &i2s_rx_handle);
+  if (err != ESP_OK) {
+    Serial.printf("I2S channel error: %d\n", err);
+    return;
+  }
+
+  i2s_pdm_rx_config_t pdm_rx_cfg = {
+    .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
+    .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+    .gpio_cfg = {
+      .clk = (gpio_num_t)I2S_MIC_CLK_PIN,
+      .din = (gpio_num_t)I2S_MIC_DATA_PIN,
+      .invert_flags = { .clk_inv = false },
+    },
+  };
+
+  err = i2s_channel_init_pdm_rx_mode(i2s_rx_handle, &pdm_rx_cfg);
+  if (err != ESP_OK) {
+    Serial.printf("I2S PDM init error: %d\n", err);
+    i2s_del_channel(i2s_rx_handle);
+    i2s_rx_handle = NULL;
+    return;
+  }
+
+  i2s_channel_enable(i2s_rx_handle);
+  Serial.println("Microphone ready.");
+}
+
+void deinitMicrophone() {
+  if (i2s_rx_handle) {
+    i2s_channel_disable(i2s_rx_handle);
+    i2s_del_channel(i2s_rx_handle);
+    i2s_rx_handle = NULL;
+  }
+}
+
 void startVideoRecording() {
   if (xSemaphoreTake(sdMutex, portMAX_DELAY)) {
     String path = "/vid_" + String(videoNumber) + ".avi"; 
@@ -763,6 +834,9 @@ void startVideoRecording() {
       Serial.println("Video file create failed");
     }
     xSemaphoreGive(sdMutex);
+  }
+  if (isRecording) {
+    initMicrophone();
   }
 }
 
@@ -796,21 +870,26 @@ void stopVideoRecording(bool showSavedMsg) {
     isRecording = false;
     xSemaphoreGive(sdMutex);
   }
+  deinitMicrophone();
 }
 
 void startAVI(File &file, int fps, int width, int height) {
   avi_movi_size = 0;
   avi_total_frames = 0;
+  avi_total_audio_chunks = 0;
   avi_start_time = millis();
   
-  // Allocate frame size array in PSRAM
-  if (avi_frame_sizes) {
-    free(avi_frame_sizes);
-    avi_frame_sizes = nullptr;
-  }
+  // Allocate frame/audio size arrays in PSRAM
+  if (avi_frame_sizes) { free(avi_frame_sizes); avi_frame_sizes = nullptr; }
+  if (avi_audio_sizes) { free(avi_audio_sizes); avi_audio_sizes = nullptr; }
   avi_frame_capacity = 36000;  // 1 hour at 10fps
   avi_frame_sizes = (uint32_t*)ps_malloc(avi_frame_capacity * sizeof(uint32_t));
-  
+  avi_audio_sizes = (uint32_t*)ps_malloc(avi_frame_capacity * sizeof(uint32_t));
+
+  if (!audio_rec_buf) {
+    audio_rec_buf = (int16_t*)ps_malloc(AUDIO_REC_BUF_SIZE);
+  }
+
   uint8_t zero_buf[avi_header_size];
   memset(zero_buf, 0, avi_header_size);
   file.write(zero_buf, avi_header_size);
@@ -846,18 +925,49 @@ bool writeAVIFrame(File &file, camera_fb_t *fb) {
   return true;
 }
 
+bool writeAVIAudioChunk(File &file, uint8_t *buf, size_t bytes) {
+  uint8_t wb_tag[4] = {0x30, 0x31, 0x77, 0x62}; // "01wb"
+  size_t w1 = file.write(wb_tag, 4);
+
+  uint32_t len = bytes;
+  uint32_t rem = len % 4;
+  uint32_t pad = (rem == 0) ? 0 : 4 - rem;
+  uint32_t totalLen = len + pad;
+
+  size_t w2 = file.write((uint8_t*)&totalLen, 4);
+  size_t w3 = file.write(buf, bytes);
+
+  if (pad > 0) {
+    uint8_t zeros[3] = {0, 0, 0};
+    file.write(zeros, pad);
+  }
+
+  if (w1 != 4 || w2 != 4 || w3 != bytes) return false;
+
+  avi_movi_size += (totalLen + 8);
+  if (avi_audio_sizes && avi_total_audio_chunks < avi_frame_capacity) {
+    avi_audio_sizes[avi_total_audio_chunks] = totalLen;
+  }
+  avi_total_audio_chunks++;
+  return true;
+}
+
 void endAVI(File &file, int fps, int width, int height) {
   unsigned long duration = millis() - avi_start_time;
   float real_fps = (float)avi_total_frames / (duration / 1000.0);
   if (real_fps <= 0) real_fps = (float)fps;
 
+  uint32_t total_audio_samples = (uint32_t)((duration / 1000.0) * AUDIO_SAMPLE_RATE);
+
   // step 1: write idx1 at end of file
   file.seek(0, SeekEnd);
   file.write((const uint8_t*)"idx1", 4);
-  uint32_t idx1Size = avi_total_frames * 16;
+  int total_idx_entries = avi_total_frames + avi_total_audio_chunks;
+  uint32_t idx1Size = total_idx_entries * 16;
   file.write((uint8_t*)&idx1Size, 4);
   
   uint32_t frameOffset = 4;  // offset from "movi" tag
+  int ai = 0;
   for (int i = 0; i < avi_total_frames; i++) {
     uint32_t frameSize = (avi_frame_sizes && i < avi_frame_capacity) ? avi_frame_sizes[i] : 0;
     file.write((const uint8_t*)"00dc", 4);
@@ -866,6 +976,26 @@ void endAVI(File &file, int fps, int width, int height) {
     file.write((uint8_t*)&frameOffset, 4);
     file.write((uint8_t*)&frameSize, 4);
     frameOffset += frameSize + 8;
+    if (ai < avi_total_audio_chunks) {
+      uint32_t aSize = (avi_audio_sizes && ai < avi_frame_capacity) ? avi_audio_sizes[ai] : 0;
+      file.write((const uint8_t*)"01wb", 4);
+      uint32_t noKf = 0x00;
+      file.write((uint8_t*)&noKf, 4);
+      file.write((uint8_t*)&frameOffset, 4);
+      file.write((uint8_t*)&aSize, 4);
+      frameOffset += aSize + 8;
+      ai++;
+    }
+  }
+  while (ai < avi_total_audio_chunks) {
+    uint32_t aSize = (avi_audio_sizes && ai < avi_frame_capacity) ? avi_audio_sizes[ai] : 0;
+    file.write((const uint8_t*)"01wb", 4);
+    uint32_t noKf = 0x00;
+    file.write((uint8_t*)&noKf, 4);
+    file.write((uint8_t*)&frameOffset, 4);
+    file.write((uint8_t*)&aSize, 4);
+    frameOffset += aSize + 8;
+    ai++;
   }
 
   // step 2: rewrite header at position 0
@@ -874,14 +1004,14 @@ void endAVI(File &file, int fps, int width, int height) {
   uint32_t totalSize = file.size();
   uint32_t riffSize = totalSize - 8;
   uint32_t microSecPerFrame = (uint32_t)(1000000.0 / real_fps);
-  uint32_t maxBytesPerSec = (width * height * 2) * real_fps; 
+  uint32_t maxBytesPerSec = (uint32_t)((width * height * 2) * real_fps) + AUDIO_SAMPLE_RATE * 2; 
 
   file.write((const uint8_t*)"RIFF", 4);
   file.write((uint8_t*)&riffSize, 4);
   file.write((const uint8_t*)"AVI ", 4);
 
   file.write((const uint8_t*)"LIST", 4);
-  uint32_t hdrlSize = 192; 
+  uint32_t hdrlSize = 292; 
   file.write((uint8_t*)&hdrlSize, 4);
   file.write((const uint8_t*)"hdrl", 4);
 
@@ -890,15 +1020,14 @@ void endAVI(File &file, int fps, int width, int height) {
   file.write((uint8_t*)&avihSize, 4);
   
   file.write((uint8_t*)&microSecPerFrame, 4);
-  uint32_t maxTransferRate = maxBytesPerSec;
-  file.write((uint8_t*)&maxTransferRate, 4); 
+  file.write((uint8_t*)&maxBytesPerSec, 4); 
   uint32_t padding = 0;
   file.write((uint8_t*)&padding, 4); 
   uint32_t avih_flags = 0x10;  // AVIF_HASINDEX
   file.write((uint8_t*)&avih_flags, 4);
   file.write((uint8_t*)&avi_total_frames, 4);
   file.write((uint8_t*)&padding, 4); 
-  uint32_t streams = 1;
+  uint32_t streams = 2;  // video + audio
   file.write((uint8_t*)&streams, 4);
   uint32_t bufSize = width * height * 2; 
   file.write((uint8_t*)&bufSize, 4);
@@ -953,15 +1082,60 @@ void endAVI(File &file, int fps, int width, int height) {
   file.write((uint8_t*)&padding, 4); 
   file.write((uint8_t*)&padding, 4); 
 
+  // audio stream LIST (strl)
+  file.write((const uint8_t*)"LIST", 4);
+  uint32_t strlSize_aud = 92;
+  file.write((uint8_t*)&strlSize_aud, 4);
+  file.write((const uint8_t*)"strl", 4);
+
+  // audio strh
+  file.write((const uint8_t*)"strh", 4);
+  file.write((uint8_t*)&strhSize, 4);
+  file.write((const uint8_t*)"auds", 4);
+  file.write((uint8_t*)&padding, 4);  // handler
+  file.write((uint8_t*)&padding, 4);  // flags
+  file.write((uint8_t*)&padding, 4);  // priority + language
+  file.write((uint8_t*)&padding, 4);  // initial frames
+  uint32_t audio_scale = 1;
+  file.write((uint8_t*)&audio_scale, 4);  // dwScale
+  uint32_t audio_rate = AUDIO_SAMPLE_RATE;
+  file.write((uint8_t*)&audio_rate, 4);   // dwRate
+  file.write((uint8_t*)&padding, 4);      // start
+  file.write((uint8_t*)&total_audio_samples, 4);  // length
+  uint32_t audio_buf_suggest = AUDIO_SAMPLE_RATE * 2;
+  file.write((uint8_t*)&audio_buf_suggest, 4);  // suggested buffer
+  file.write((uint8_t*)&padding, 4);   // quality
+  uint32_t audio_sample_size = 2;
+  file.write((uint8_t*)&audio_sample_size, 4);  // sample size
+  file.write((uint8_t*)&padding, 4);   // rect left+top
+  file.write((uint8_t*)&padding, 4);   // rect right+bottom
+
+  // audio strf (PCMWAVEFORMAT)
+  file.write((const uint8_t*)"strf", 4);
+  uint32_t strfSize_aud = 16;
+  file.write((uint8_t*)&strfSize_aud, 4);
+  uint16_t wFormatTag = 1;  // PCM
+  file.write((uint8_t*)&wFormatTag, 2);
+  uint16_t nChannels = 1;
+  file.write((uint8_t*)&nChannels, 2);
+  uint32_t nSamplesPerSec = AUDIO_SAMPLE_RATE;
+  file.write((uint8_t*)&nSamplesPerSec, 4);
+  uint32_t nAvgBytesPerSec = AUDIO_SAMPLE_RATE * 2;
+  file.write((uint8_t*)&nAvgBytesPerSec, 4);
+  uint16_t nBlockAlign = 2;
+  file.write((uint8_t*)&nBlockAlign, 2);
+  uint16_t wBitsPerSample = 16;
+  file.write((uint8_t*)&wBitsPerSample, 2);
+
+  // movi LIST header
   file.write((const uint8_t*)"LIST", 4);
   uint32_t moviListSize = 4 + avi_movi_size;
   file.write((uint8_t*)&moviListSize, 4);
   file.write((const uint8_t*)"movi", 4);
 
-  if (avi_frame_sizes) {
-    free(avi_frame_sizes);
-    avi_frame_sizes = nullptr;
-  }
+  if (avi_frame_sizes) { free(avi_frame_sizes); avi_frame_sizes = nullptr; }
+  if (avi_audio_sizes) { free(avi_audio_sizes); avi_audio_sizes = nullptr; }
+  if (audio_rec_buf) { free(audio_rec_buf); audio_rec_buf = nullptr; }
   avi_frame_capacity = 0;
 
   file.close();

@@ -1,11 +1,11 @@
 # XIAO ESP32-S3 Sense Retro Camera
 
-A compact digital camera implementation using the Seeed Studio XIAO ESP32-S3 Sense development board and a 2.0" TFT LCD display (ST7789VW). Features high-resolution photo capture, AVI video recording, and a live viewfinder with FreeRTOS multitasking for robust operation.
+A compact digital camera implementation using the Seeed Studio XIAO ESP32-S3 Sense development board and a 2.0" TFT LCD display (ST7789VW). Features high-resolution photo capture, AVI video recording with audio, and a live viewfinder with FreeRTOS multitasking for robust operation.
 
 ## Features
 
 - **High-Resolution Photo Capture:** Saves HD JPEG images (FRAMESIZE_HD: 1280×720) to the SD card.
-- **Video Recording:** Records MJPEG video streams in AVI container format (FRAMESIZE_HVGA: 480×320, 7-10 FPS).
+- **Video Recording:** Records MJPEG video with PCM audio in AVI container format (FRAMESIZE_HVGA: 480×320, 7-10 FPS, 16 kHz mono audio via built-in PDM microphone).
 - **Live Viewfinder:** Real-time camera feed (320×240 RGB565) displayed on the 2.0" TFT display with up to 320×216 pixel preview area.
 - **Hardware Mirroring:** Toggle horizontal image mirroring using the built-in Boot button (selfie mode support).
 - **Robust Multitasking:** Uses FreeRTOS dual-task architecture for concurrent camera feed processing, SD card monitoring, and real-time UI updates.
@@ -136,14 +136,14 @@ When the Seeed Studio XIAO ESP32-S3 is powered via the battery connector, the 5V
 
 ### Recording Video
 - **Action:** Long press (> 1 second) the shutter button (GPIO 5)
-- **Process:** Camera switches to video mode (FRAMESIZE_HVGA, 10 FPS), begins AVI encoding
+- **Process:** Camera switches to video mode (FRAMESIZE_HVGA, 10 FPS), begins AVI encoding with audio capture from the built-in PDM microphone
 - **Display:** 
   - Clears screen and enters recording mode
   - Shows blinking red recording indicator (top-left)
   - Displays elapsed time in HH:MM:SS format (top-left)
   - Video preview scaled to fit screen
 - **Stop Recording:** Press shutter button again (requires > 2 seconds of recording)
-- **Result:** MJPEG video saved as `/vid_N.avi`
+- **Result:** MJPEG video with PCM audio saved as `/vid_N.avi`
 - **Note:** Recording pauses live preview; FPS counter shows actual recording frame rate
 
 ### Image Mirroring
@@ -175,8 +175,9 @@ When the Seeed Studio XIAO ESP32-S3 is powered via the battery connector, the 5V
 
 ### Video Encoding Details
 
-- **Format:** MJPEG (Motion JPEG) frames inside AVI container
-- **Resolution:** 480×320 at 10 FPS (actual FPS auto-adjusted based on system load)
+- **Format:** MJPEG (Motion JPEG) video + PCM audio inside AVI container
+- **Video Resolution:** 480×320 at 10 FPS (actual FPS auto-adjusted based on system load)
+- **Audio:** 16 kHz, 16-bit, mono PCM via built-in PDM microphone
 - **Duration Support:** PSRAM allocation supports ~36000 frames (~1 hour at 10 FPS)
 
 ### Multitasking Architecture
