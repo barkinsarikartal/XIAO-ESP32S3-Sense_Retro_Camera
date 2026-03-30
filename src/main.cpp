@@ -966,33 +966,29 @@ void endAVI(File &file, int fps, int width, int height) {
   uint32_t idx1Size = total_idx_entries * 16;
   file.write((uint8_t*)&idx1Size, 4);
   
-  uint32_t frameOffset = 4;  // offset from "movi" tag
-  int ai = 0;
-  for (int i = 0; i < avi_total_frames; i++) {
-    uint32_t frameSize = (avi_frame_sizes && i < avi_frame_capacity) ? avi_frame_sizes[i] : 0;
-    file.write((const uint8_t*)"00dc", 4);
-    uint32_t kf = 0x10;  // AVIIF_KEYFRAME
-    file.write((uint8_t*)&kf, 4);
-    file.write((uint8_t*)&frameOffset, 4);
-    file.write((uint8_t*)&frameSize, 4);
-    frameOffset += frameSize + 8;
-    if (ai < avi_total_audio_chunks) {
+  uint32_t chunkOffset = 4;
+  int vi = 0, ai = 0;
+  for (int i = 0; i < total_idx_entries; i++) {
+    if (avi_chunk_order && avi_chunk_order[i] == 0) {
+      uint32_t fSize = (avi_frame_sizes && vi < avi_frame_capacity) ? avi_frame_sizes[vi] : 0;
+      file.write((const uint8_t*)"00dc", 4);
+      uint32_t kf = 0x10;
+      file.write((uint8_t*)&kf, 4);
+      file.write((uint8_t*)&chunkOffset, 4);
+      file.write((uint8_t*)&fSize, 4);
+      chunkOffset += fSize + 8;
+      vi++;
+    } else {
       uint32_t aSize = (avi_audio_sizes && ai < avi_frame_capacity) ? avi_audio_sizes[ai] : 0;
       file.write((const uint8_t*)"01wb", 4);
       uint32_t noKf = 0x00;
       file.write((uint8_t*)&noKf, 4);
-      file.write((uint8_t*)&frameOffset, 4);
+      file.write((uint8_t*)&chunkOffset, 4);
       file.write((uint8_t*)&aSize, 4);
-      frameOffset += aSize + 8;
+      chunkOffset += aSize + 8;
       ai++;
     }
   }
-  while (ai < avi_total_audio_chunks) {
-    uint32_t aSize = (avi_audio_sizes && ai < avi_frame_capacity) ? avi_audio_sizes[ai] : 0;
-    file.write((const uint8_t*)"01wb", 4);
-    uint32_t noKf = 0x00;
-    file.write((uint8_t*)&noKf, 4);
-    file.write((uint8_t*)&frameOffset, 4);
     file.write((uint8_t*)&aSize, 4);
     frameOffset += aSize + 8;
     ai++;
@@ -1000,43 +996,43 @@ void endAVI(File &file, int fps, int width, int height) {
 
   // step 2: rewrite header at position 0
   file.seek(0);
-  
+
   uint32_t totalSize = file.size();
   uint32_t riffSize = totalSize - 8;
   uint32_t microSecPerFrame = (uint32_t)(1000000.0 / real_fps);
-  uint32_t maxBytesPerSec = (uint32_t)((width * height * 2) * real_fps) + AUDIO_SAMPLE_RATE * 2; 
+  uint32_t maxBytesPerSec = (uint32_t)((width * height * 2) * real_fps) + AUDIO_SAMPLE_RATE * 2;
 
   file.write((const uint8_t*)"RIFF", 4);
   file.write((uint8_t*)&riffSize, 4);
   file.write((const uint8_t*)"AVI ", 4);
 
   file.write((const uint8_t*)"LIST", 4);
-  uint32_t hdrlSize = 292; 
+  uint32_t hdrlSize = 292;
   file.write((uint8_t*)&hdrlSize, 4);
   file.write((const uint8_t*)"hdrl", 4);
 
   file.write((const uint8_t*)"avih", 4);
   uint32_t avihSize = 56;
   file.write((uint8_t*)&avihSize, 4);
-  
+
   file.write((uint8_t*)&microSecPerFrame, 4);
-  file.write((uint8_t*)&maxBytesPerSec, 4); 
+  file.write((uint8_t*)&maxBytesPerSec, 4);
   uint32_t padding = 0;
-  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4);
   uint32_t avih_flags = 0x10;  // AVIF_HASINDEX
   file.write((uint8_t*)&avih_flags, 4);
   file.write((uint8_t*)&avi_total_frames, 4);
-  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4);
   uint32_t streams = 2;  // video + audio
   file.write((uint8_t*)&streams, 4);
-  uint32_t bufSize = width * height * 2; 
+  uint32_t bufSize = width * height * 2;
   file.write((uint8_t*)&bufSize, 4);
   file.write((uint8_t*)&width, 4);
   file.write((uint8_t*)&height, 4);
-  file.write((uint8_t*)&padding, 4); 
-  file.write((uint8_t*)&padding, 4); 
-  file.write((uint8_t*)&padding, 4); 
-  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
 
   file.write((const uint8_t*)"LIST", 4);
   uint32_t strlSize = 116;
@@ -1046,41 +1042,41 @@ void endAVI(File &file, int fps, int width, int height) {
   file.write((const uint8_t*)"strh", 4);
   uint32_t strhSize = 56;
   file.write((uint8_t*)&strhSize, 4);
-  file.write((const uint8_t*)"vids", 4); 
-  file.write((const uint8_t*)"MJPG", 4); 
-  file.write((uint8_t*)&padding, 4);  
-  file.write((uint8_t*)&padding, 4); 
-  file.write((uint8_t*)&padding, 4); 
+  file.write((const uint8_t*)"vids", 4);
+  file.write((const uint8_t*)"MJPG", 4);
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
   uint32_t scale = 1;
   file.write((uint8_t*)&scale, 4);
   uint32_t rate = (uint32_t)real_fps;
-  if(rate == 0) rate = 10;
+  if (rate == 0) rate = 10;
   file.write((uint8_t*)&rate, 4);
-  file.write((uint8_t*)&padding, 4); 
-  file.write((uint8_t*)&avi_total_frames, 4); 
-  file.write((uint8_t*)&bufSize, 4); 
-  file.write((uint8_t*)&padding, 4); 
-  file.write((uint8_t*)&padding, 4); 
-  file.write((uint8_t*)&padding, 4); 
-  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&avi_total_frames, 4);
+  file.write((uint8_t*)&bufSize, 4);
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
 
   file.write((const uint8_t*)"strf", 4);
   uint32_t strfSize = 40;
   file.write((uint8_t*)&strfSize, 4);
-  file.write((uint8_t*)&strfSize, 4); 
+  file.write((uint8_t*)&strfSize, 4);
   file.write((uint8_t*)&width, 4);
   file.write((uint8_t*)&height, 4);
   uint16_t planes = 1;
   file.write((uint8_t*)&planes, 2);
   uint16_t bitCount = 24;
   file.write((uint8_t*)&bitCount, 2);
-  file.write((const uint8_t*)"MJPG", 4); 
+  file.write((const uint8_t*)"MJPG", 4);
   uint32_t imageSize = width * height * 3;
   file.write((uint8_t*)&imageSize, 4);
-  file.write((uint8_t*)&padding, 4); 
-  file.write((uint8_t*)&padding, 4); 
-  file.write((uint8_t*)&padding, 4); 
-  file.write((uint8_t*)&padding, 4); 
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
 
   // audio stream LIST (strl)
   file.write((const uint8_t*)"LIST", 4);
@@ -1092,23 +1088,23 @@ void endAVI(File &file, int fps, int width, int height) {
   file.write((const uint8_t*)"strh", 4);
   file.write((uint8_t*)&strhSize, 4);
   file.write((const uint8_t*)"auds", 4);
-  file.write((uint8_t*)&padding, 4);  // handler
-  file.write((uint8_t*)&padding, 4);  // flags
-  file.write((uint8_t*)&padding, 4);  // priority + language
-  file.write((uint8_t*)&padding, 4);  // initial frames
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
   uint32_t audio_scale = 1;
-  file.write((uint8_t*)&audio_scale, 4);  // dwScale
+  file.write((uint8_t*)&audio_scale, 4);
   uint32_t audio_rate = AUDIO_SAMPLE_RATE;
-  file.write((uint8_t*)&audio_rate, 4);   // dwRate
-  file.write((uint8_t*)&padding, 4);      // start
-  file.write((uint8_t*)&total_audio_samples, 4);  // length
+  file.write((uint8_t*)&audio_rate, 4);
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&total_audio_samples, 4);
   uint32_t audio_buf_suggest = AUDIO_SAMPLE_RATE * 2;
-  file.write((uint8_t*)&audio_buf_suggest, 4);  // suggested buffer
-  file.write((uint8_t*)&padding, 4);   // quality
+  file.write((uint8_t*)&audio_buf_suggest, 4);
+  file.write((uint8_t*)&padding, 4);
   uint32_t audio_sample_size = 2;
-  file.write((uint8_t*)&audio_sample_size, 4);  // sample size
-  file.write((uint8_t*)&padding, 4);   // rect left+top
-  file.write((uint8_t*)&padding, 4);   // rect right+bottom
+  file.write((uint8_t*)&audio_sample_size, 4);
+  file.write((uint8_t*)&padding, 4);
+  file.write((uint8_t*)&padding, 4);
 
   // audio strf (PCMWAVEFORMAT)
   file.write((const uint8_t*)"strf", 4);
@@ -1135,7 +1131,7 @@ void endAVI(File &file, int fps, int width, int height) {
 
   if (avi_frame_sizes) { free(avi_frame_sizes); avi_frame_sizes = nullptr; }
   if (avi_audio_sizes) { free(avi_audio_sizes); avi_audio_sizes = nullptr; }
-  if (audio_rec_buf) { free(audio_rec_buf); audio_rec_buf = nullptr; }
+  if (avi_chunk_order) { free(avi_chunk_order); avi_chunk_order = nullptr; }
   avi_frame_capacity = 0;
 
   file.close();
