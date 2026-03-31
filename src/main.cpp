@@ -86,8 +86,15 @@
 #define IDLE_JPEG_QUALITY 0
 
 // ================= AUDIO SETTINGS =================
-#define AUDIO_SAMPLE_RATE   16000
-#define AUDIO_REC_BUF_SIZE  8192
+#define AUDIO_SAMPLE_RATE       16000
+#define AUDIO_REC_BUF_SIZE       8192
+
+// ================= VIDEO / AUDIO TIMING =================
+// A single constant for declared FPS keeps the AVI header, the audio chunk
+// size, and the I2S DMA geometry all in sync with each other.
+#define TARGET_FPS               10
+#define AUDIO_SAMPLES_PER_FRAME  (AUDIO_SAMPLE_RATE / TARGET_FPS)   // 1600 samples
+#define AUDIO_BYTES_PER_FRAME    (AUDIO_SAMPLES_PER_FRAME * 2)      // 3200 bytes
 
 // ================= AVI CAPACITY =================
 // Pre-sized for max ~15 min @ 10 FPS. Allocated once at boot to avoid PSRAM fragmentation.
@@ -297,7 +304,7 @@ void setup() {
 
   allocateBuffers();
 
-  delay(3000);
+  delay(8000);
 
   // Task: SD Card Monitor (Core 0, Priority 1)
   xTaskCreatePinnedToCore(taskSDMonitor, "SD_Mon", 4096, NULL, 1, NULL, 0);
@@ -772,10 +779,20 @@ void taskRecorder(void *pvParameters) {
 
     RecFrame rf;
     if (xQueueReceive(recFrameQueue, &rf, pdMS_TO_TICKS(100)) == pdTRUE) {
-      // Read audio right before SD write (non-blocking, matches original code)
+      // Read exactly one frame's worth of audio from the I2S DMA ring buffer.
+      // Because dma_frame_num=160 gives 320-byte DMA slots, AUDIO_BYTES_PER_FRAME
+      // (3200) drains in exactly 10 slots — i.e. one slot per 10 ms of audio.
+      // Zero-pad any shortage so every video frame gets a fixed-size audio chunk;
+      // this keeps total audio sample count predictable and prevents AV drift.
       size_t audio_bytes_read = 0;
       if (i2s_rx_handle && audioRecBuf) {
-        i2s_channel_read(i2s_rx_handle, audioRecBuf, AUDIO_REC_BUF_SIZE, &audio_bytes_read, 0);
+        i2s_channel_read(i2s_rx_handle, audioRecBuf, AUDIO_BYTES_PER_FRAME,
+                         &audio_bytes_read, 0);
+        if (audio_bytes_read < AUDIO_BYTES_PER_FRAME) {
+          memset((uint8_t*)audioRecBuf + audio_bytes_read, 0,
+                 AUDIO_BYTES_PER_FRAME - audio_bytes_read);
+          audio_bytes_read = AUDIO_BYTES_PER_FRAME;
+        }
       }
 
       // portMAX_DELAY: never silently drop a frame. If SD is slow, backpressure
@@ -783,6 +800,8 @@ void taskRecorder(void *pvParameters) {
       if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
         if (videoFile) {
           bool ok = writeAVIFrameFromBuf(videoFile, recPool[rf.idx], rf.len);
+          // Always write audio chunk — consistent chunk per frame is required for
+          // correct sync. Missing chunks cause cumulative drift; silence is better.
           if (ok && audio_bytes_read > 0) {
             writeAVIAudioChunk(videoFile, (uint8_t*)audioRecBuf, audio_bytes_read);
           }
@@ -955,9 +974,13 @@ void initCamera(pixformat_t format, framesize_t size, int jpeg_quality) {
 // ================= MICROPHONE =================
 void initMicrophone() {
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-  chan_cfg.dma_desc_num = 8;
-  chan_cfg.dma_frame_num = 512;
-  chan_cfg.auto_clear = true;
+  // DMA geometry tuned for exact per-frame audio drain:
+  //   dma_frame_num=160 → 160 × 2 bytes = 320 bytes per DMA slot (fills in 10 ms)
+  //   AUDIO_BYTES_PER_FRAME (3200) / 320 = 10 slots → drains in exact multiples
+  //   dma_desc_num=16   → 16 × 320 = 5120 bytes total buffer ≈ 160 ms capacity
+  chan_cfg.dma_desc_num  = 16;
+  chan_cfg.dma_frame_num = 160;
+  chan_cfg.auto_clear    = true;
 
   esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &i2s_rx_handle);
   if (err != ESP_OK) {
@@ -1077,10 +1100,19 @@ bool writeAVIAudioChunk(File &file, uint8_t *buf, size_t bytes) {
 
 void endAVI(File &file, int fps, int width, int height) {
   unsigned long duration = millis() - avi_start_time;
-  float real_fps = (float)avi_total_frames / (duration / 1000.0);
-  if (real_fps <= 0) real_fps = (float)fps;
+  float real_fps = (float)avi_total_frames / (duration / 1000.0f);
+  if (real_fps <= 0) real_fps = (float)TARGET_FPS;
+  Serial.printf("[REC] Actual FPS: %.2f, frames: %d, audio chunks: %d\n",
+                real_fps, avi_total_frames, avi_total_audio_chunks);
 
-  uint32_t total_audio_samples = (uint32_t)((duration / 1000.0) * AUDIO_SAMPLE_RATE);
+  // Use the declared TARGET_FPS for the AVI header rather than the measured average.
+  // The measured average is skewed by the camera warm-up period and variable SD
+  // write latency; a stable constant gives AVI players a reliable timing baseline.
+  uint32_t microSecPerFrame = 1000000UL / TARGET_FPS;
+
+  // Each audio chunk is exactly AUDIO_BYTES_PER_FRAME bytes (zero-padded when
+  // needed), so total samples is exactly chunks × samples-per-chunk.
+  uint32_t total_audio_samples = (uint32_t)avi_total_audio_chunks * AUDIO_SAMPLES_PER_FRAME;
 
   // step 1: write idx1 at end of file
   file.seek(0, SeekEnd);
@@ -1119,8 +1151,9 @@ void endAVI(File &file, int fps, int width, int height) {
 
   uint32_t totalSize = file.size();
   uint32_t riffSize = totalSize - 8;
-  uint32_t microSecPerFrame = (uint32_t)(1000000.0 / real_fps);
-  uint32_t maxBytesPerSec = (uint32_t)((width * height * 2) * real_fps) + AUDIO_SAMPLE_RATE * 2;
+  // microSecPerFrame is derived from TARGET_FPS (set in endAVI preamble), not real_fps.
+  uint32_t microSecPerFrame_hdr = 1000000UL / TARGET_FPS;
+  uint32_t maxBytesPerSec = (uint32_t)((width * height * 2) * TARGET_FPS) + AUDIO_SAMPLE_RATE * 2;
 
   file.write((const uint8_t*)"RIFF", 4);
   file.write((uint8_t*)&riffSize, 4);
@@ -1135,7 +1168,7 @@ void endAVI(File &file, int fps, int width, int height) {
   uint32_t avihSize = 56;
   file.write((uint8_t*)&avihSize, 4);
 
-  file.write((uint8_t*)&microSecPerFrame, 4);
+  file.write((uint8_t*)&microSecPerFrame_hdr, 4);
   file.write((uint8_t*)&maxBytesPerSec, 4);
   uint32_t padding = 0;
   file.write((uint8_t*)&padding, 4);
@@ -1169,7 +1202,7 @@ void endAVI(File &file, int fps, int width, int height) {
   file.write((uint8_t*)&padding, 4);
   uint32_t scale = 1;
   file.write((uint8_t*)&scale, 4);
-  uint32_t rate = (uint32_t)real_fps;
+  uint32_t rate = TARGET_FPS;
   if (rate == 0) rate = 10;
   file.write((uint8_t*)&rate, 4);
   file.write((uint8_t*)&padding, 4);
