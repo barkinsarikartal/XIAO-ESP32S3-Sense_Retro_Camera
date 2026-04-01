@@ -1,28 +1,35 @@
 # XIAO ESP32-S3 Sense Retro Camera
 
-A compact digital camera implementation using the Seeed Studio XIAO ESP32-S3 Sense development board and a 2.0" TFT LCD display (ST7789VW). Features high-resolution photo capture, AVI video recording with audio, and a live viewfinder with FreeRTOS multitasking for robust operation.
+A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Sense. Captures high-resolution photos and MJPEG/PCM audio video, with a live viewfinder on a 2.0" TFT display. Runs a multi-task FreeRTOS architecture for robust, concurrent operation.
+
+---
 
 ## Features
 
-- **High-Resolution Photo Capture:** Saves HD JPEG images (FRAMESIZE_HD: 1280×720) to the SD card.
-- **Video Recording:** Records MJPEG video with PCM audio in AVI container format (FRAMESIZE_HVGA: 480×320, 7-10 FPS, 16 kHz mono audio via built-in PDM microphone).
-- **Live Viewfinder:** Real-time camera feed (320×240 RGB565) displayed on the 2.0" TFT display with up to 320×216 pixel preview area.
-- **Hardware Mirroring:** Toggle horizontal image mirroring using the built-in Boot button (selfie mode support).
-- **Robust Multitasking:** Uses FreeRTOS dual-task architecture for concurrent camera feed processing, SD card monitoring, and real-time UI updates.
-- **Performance Monitoring:** Live FPS counter and SD card status indicator on screen.
-- **Error Handling:** Comprehensive error detection with on-screen notifications for camera failures, SD card issues, and write errors.
-- **PSRAM Optimization:** Efficient use of ESP32-S3 PSRAM for frame buffering and AVI index storage.
+- **High-Resolution Photo Capture** — HD JPEG images (1280×720) saved to SD card
+- **Video Recording with Audio** — MJPEG video at 480×320, 10 FPS, with 16 kHz mono PCM audio via the built-in PDM microphone, saved as `.avi`
+- **Live Viewfinder** — Real-time 320×240 RGB565 camera preview on the TFT display
+- **Hardware Mirroring** — Toggle horizontal flip (selfie mode) via the built-in Boot button
+- **FPS Counter & SD Status** — Live overlay showing frame rate and SD card health
+- **Reliable AVI Encoding** — Accurate `idx1` index table built from actual chunk write order; `microSecPerFrame` derived from declared target FPS, not a variable end-of-recording average
+- **A/V Synchronisation** — I2S DMA geometry tuned to drain exactly one video frame's worth of audio per read (`AUDIO_BYTES_PER_FRAME = 3200` bytes, 10×320-byte DMA slots); fixes cumulative drift
+- **Atomic Multi-Core Synchronisation** — `std::atomic<int>` for all inter-core display-buffer state, preventing SMP data races
+- **PSRAM Efficiency** — AVI metadata arrays (frame sizes, audio sizes, chunk order) allocated once at boot and `memset` per recording session, eliminating heap fragmentation
 
-## Hardware Required
+---
 
-- **Microcontroller:** Seeed Studio XIAO ESP32-S3 Sense (with OV2640 camera & SD Card expansion board)
-- **Display:** 2.0" TFT LCD Display Module (ST7789VW driver, 240×320 resolution, SPI interface)
-- **Buttons:** 
-  - 1× Dual-leg shutter button (for photo/video control)
-  - 1× Boot button on XIAO board (for image mirroring)
-- **Storage:** MicroSD Card (FAT32 formatted)
-- **Power:** 3.7V Li-ion battery or USB-C power (via XIAO board)
-- **Connecting Wires & Solder** (for perfboard assembly)
+## Hardware
+
+| Component | Part |
+|---|---|
+| Microcontroller | Seeed Studio XIAO ESP32-S3 Sense (OV2640 + SD card expansion) |
+| Display | 2.0" TFT LCD — ST7789VW, 240×320, SPI |
+| Shutter button | 1× tactile button (GPIO 4 / GPIO 5) |
+| Mirror button | Built-in Boot button (GPIO 0) |
+| Storage | MicroSD card, FAT32 formatted |
+| Power | 3.7 V Li-ion battery or USB-C |
+
+---
 
 ## Pin Configuration
 
@@ -34,197 +41,163 @@ A compact digital camera implementation using the Seeed Studio XIAO ESP32-S3 Sen
       <td valign="top" align="center">
         <h3>TFT Display (ST7789VW)</h3>
         <table>
-          <tr>
-            <th>TFT Pin</th>
-            <th>XIAO ESP32-S3 Pin</th>
-          </tr>
-          <tr>
-            <td>GND</td>
-            <td>GND</td>
-          </tr>
-          <tr>
-            <td>VCC</td>
-            <td>3.3V</td>
-          </tr>
-          <tr>
-            <td>SCL</td>
-            <td>GPIO 7</td>
-          </tr>
-          <tr>
-            <td>SDA</td>
-            <td>GPIO 9</td>
-          </tr>
-          <tr>
-            <td>RESET</td>
-            <td>GPIO 3</td>
-          </tr>
-          <tr>
-            <td>DC</td>
-            <td>GPIO 2</td>
-          </tr>
-          <tr>
-            <td>CS</td>
-            <td>GPIO 1</td>
-          </tr>
+          <tr><th>TFT Pin</th><th>GPIO</th></tr>
+          <tr><td>GND</td><td>GND</td></tr>
+          <tr><td>VCC</td><td>3.3 V</td></tr>
+          <tr><td>SCL (SCK)</td><td>GPIO 7</td></tr>
+          <tr><td>SDA (MOSI)</td><td>GPIO 9</td></tr>
+          <tr><td>RESET</td><td>GPIO 3</td></tr>
+          <tr><td>DC</td><td>GPIO 2</td></tr>
+          <tr><td>CS</td><td>GPIO 1</td></tr>
         </table>
       </td>
-      <td width="20"></td> <td valign="top" align="center">
-        <h3>Shutter Button & Control</h3>
+      <td width="20"></td>
+      <td valign="top" align="center">
+        <h3>Buttons & Control</h3>
         <table>
-          <tr>
-            <th>Button Function</th>
-            <th>XIAO ESP32-S3 Pin</th>
-          </tr>
-          <tr>
-            <td>Shutter Button 1</td>
-            <td>GPIO 4 (Output)</td>
-          </tr>
-          <tr>
-            <td>Shutter Button 2</td>
-            <td>GPIO 5 (Input)</td>
-          </tr>
-          <tr>
-            <td>Boot Button (Mirroring)</td>
-            <td>GPIO 0 (Built-in)</td>
-          </tr>
+          <tr><th>Function</th><th>GPIO</th></tr>
+          <tr><td>Shutter — leg 1</td><td>GPIO 4 (OUTPUT)</td></tr>
+          <tr><td>Shutter — leg 2</td><td>GPIO 5 (INPUT_PULLUP)</td></tr>
+          <tr><td>Mirror toggle</td><td>GPIO 0 (Boot, built-in)</td></tr>
+          <tr><td>SD Card CS</td><td>GPIO 21</td></tr>
+          <tr><td>Mic CLK (PDM)</td><td>GPIO 42</td></tr>
+          <tr><td>Mic DATA (PDM)</td><td>GPIO 41</td></tr>
+          <tr><td colspan="2"><em>TFT and SD share SPI2_HOST (MISO: GPIO 8)</em></td></tr>
         </table>
       </td>
     </tr>
   </table>
 </div>
 
-## Assembly & Battery Power
-
-To create a portable retro camera, components are soldered onto a perfboard and powered by a 3.7V 18650 Li-ion battery.
-
-**Important Power Requirement:**
-When the Seeed Studio XIAO ESP32-S3 is powered via the battery connector, the 5V output is disabled. Therefore, the **TFT Display VCC and LED pins must be connected to the 3.3V pin** instead of 5V to ensure proper operation on battery power.
+---
 
 ## Installation & Setup
 
-### PlatformIO Installation (Recommended)
+### PlatformIO (Recommended)
 
-1. **Install Visual Studio Code** with the PlatformIO extension
-2. **Clone/Open Project:** Open the project folder in VS Code
-3. **Configure Board:** PlatformIO automatically detects the `seeed_xiao_esp32s3` board from `platformio.ini`
-4. **Configure Libraries:** Required libraries are specified in `platformio.ini`:
-   - `lovyan03/LovyanGFX` (Display driver)
-   - `espressif/esp32-camera` (Camera support)
-5. **Build:** Run `PlatformIO: Build` from the command palette
-6. **Upload:** Connect XIAO ESP32-S3 via USB-C and run `PlatformIO: Upload`
-7. **Monitor:** Open the serial monitor at 115200 baud to view debug output
+1. Install **Visual Studio Code** with the PlatformIO extension
+2. Clone / open this folder in VS Code
+3. PlatformIO auto-detects `seeed_xiao_esp32s3` from `platformio.ini`
+4. **Build:** `PlatformIO: Build`
+5. **Upload:** Connect XIAO via USB-C → `PlatformIO: Upload`
+6. **Monitor:** Serial monitor at **115200 baud**
 
-### Alternative: Arduino IDE Setup
+### Arduino IDE
 
-1. **Install Arduino IDE:** Version 2.0 or later
-2. **Add Board Manager URL:** In Settings, add:
-   - https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-3. **Install ESP32 Package:** Board Manager > Search "esp32" > Install "esp32 by Espressif Systems" (v3.x or later)
-4. **Select Board:** Tools > Board > esp32 > "XIAO_ESP32S3"
-5. **Configure PSRAM:** Tools > PSRAM > "OPI PSRAM"
-6. **Install LovyanGFX:** Library Manager > Search "LovyanGFX" > Install latest version
-7. **Select Sketch:** Open `src/main.cpp` (or copy to Arduino IDE as `.ino`)
-8. **Upload:** Connect board and upload
+1. Board Manager URL: `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
+2. Install **esp32 by Espressif Systems** (v3.x+)
+3. Board: **XIAO_ESP32S3** | PSRAM: **OPI PSRAM**
+4. Install **LovyanGFX** via Library Manager
+5. Open `src/main.cpp`, upload
+
+---
 
 ## Usage
 
 ### Taking a Photo
-- **Action:** Short press (< 1 second) the shutter button (GPIO 5)
-- **Process:** Camera switches to HD mode (FRAMESIZE_HD), captures image, saves to SD card
-- **Display:** Shows "HOLD ON..." dialog while saving; "PIC SAVED #X" confirmation after success
-- **Result:** High-resolution JPEG saved as `/hd_pic_N.jpg`
+- **Short press** (< 1 s) the shutter button
+- Camera switches to HD mode, captures, saves → `/pic_N.jpg`
+- Screen shows "HOLD ON…" then "PIC SAVED #N"
 
 ### Recording Video
-- **Action:** Long press (> 1 second) the shutter button (GPIO 5)
-- **Process:** Camera switches to video mode (FRAMESIZE_HVGA, 10 FPS), begins AVI encoding with audio capture from the built-in PDM microphone
-- **Display:** 
-  - Clears screen and enters recording mode
-  - Shows blinking red recording indicator (top-left)
-  - Displays elapsed time in HH:MM:SS format (top-left)
-  - Video preview scaled to fit screen
-- **Stop Recording:** Press shutter button again (requires > 2 seconds of recording)
-- **Result:** MJPEG video with PCM audio saved as `/vid_N.avi`
-- **Note:** Recording pauses live preview; FPS counter shows actual recording frame rate
+- **Long press** (> 1 s) the shutter button to start
+- Records MJPEG + PCM audio → `/vid_N.avi`
+- Screen shows blinking red indicator + elapsed time HH:MM:SS
+- **Press again** to stop (minimum 2 s of recording)
 
 ### Image Mirroring
-- **Action:** Press the small "Boot" button (GPIO 0) on the XIAO board
-- **Result:** Camera feed horizontally flips (hardware mirroring)
-- **Use:** Toggle between normal and selfie mode
+- Press the **Boot button** (GPIO 0) to toggle horizontal flip
 
-### SD Card Monitoring
-- **Automatic Monitoring:** Dedicated FreeRTOS task monitors SD card status every 2 seconds
-- **Status Indicator:** Green dot (bottom-right of screen) = SD ready; Red dot = card missing/full
-- **Recording Safety:** If SD card is removed or becomes full during recording, recording automatically stops with warning message
+### SD Card Status
+- **Green dot** (bottom-right) = SD ready
+- **Red dot** = card missing, full, or error
+- Recording auto-stops if card is removed or full
+
+---
 
 ## Technical Details
 
-### Display & Camera Configuration
+### Recording Configuration
 
-| Setting | Live Preview | Photo Mode | Video Mode |
-|---------|---|---|---|
-| **Pixel Format** | RGB565 | JPEG | JPEG |
-| **Resolution** | FRAMESIZE_QVGA (320×240) | FRAMESIZE_HD (1280×720) | FRAMESIZE_HVGA (480×320) |
-| **Display Area** | 320×216 pixels + 24px FPS bar | N/A | ~240×160 scaled preview |
-| **JPEG Quality** | 0 (lossless RGB) | 12 (high quality) | 12 (high quality) |
+| Setting | Live Preview | Photo | Video |
+|---|---|---|---|
+| Format | RGB565 | JPEG | JPEG |
+| Resolution | QVGA 320×240 | HD 1280×720 | HVGA 480×320 |
+| Target FPS | — | — | 10 |
+| JPEG Quality | — | 12 | 12 |
 
-### File System & Storage
+### A/V Synchronisation
 
-- **Photo Files:** Sequential naming: `/hd_pic_0.jpg`, `/hd_pic_1.jpg`, etc.
-- **Video Files:** Sequential naming: `/vid_0.avi`, `/vid_1.avi`, etc.
-- **Counter Persistence:** Picture and video counters stored in EEPROM (survives power loss)
+Audio timing is pinned exactly to video frame rate:
 
-### Video Encoding Details
+```
+AUDIO_SAMPLE_RATE       = 16 000 Hz
+TARGET_FPS              = 10
+AUDIO_SAMPLES_PER_FRAME = 1 600
+AUDIO_BYTES_PER_FRAME   = 3 200
 
-- **Format:** MJPEG (Motion JPEG) video + PCM audio inside AVI container
-- **Video Resolution:** 480×320 at 10 FPS (actual FPS auto-adjusted based on system load)
-- **Audio:** 16 kHz, 16-bit, mono PCM via built-in PDM microphone
-- **Duration Support:** PSRAM allocation supports ~36000 frames (~1 hour at 10 FPS)
+I2S DMA: dma_frame_num=160 → 320 bytes/slot
+         3200 / 320 = 10 slots = exactly 1 video frame interval
+```
 
-### Multitasking Architecture
+Every video frame always receives one audio chunk (zero-padded if the DMA hasn't filled completely). `microSecPerFrame` in the AVI header is written from `TARGET_FPS`, not a variable post-recording average.
 
-- **Task 1 (Core 0):** SD Card Monitor
-  - Priority: Low (1)
-  - Stack: 4 KB
-  - Duty: Monitor SD card status, free space, removal detection
-  
-- **Task 2 (Core 1):** Camera & UI
-  - Priority: High (5)
-  - Stack: 8 KB
-  - Duty: Camera capture, screen rendering, button handling, photo/video save
+### File Storage
 
-- **Synchronization:** FreeRTOS mutexes protect concurrent SD card and display access
+| File | Path pattern | Counter storage |
+|---|---|---|
+| Photo | `/pic_N.jpg` | EEPROM |
+| Video | `/vid_N.avi` | EEPROM |
 
-## Interface & On-Screen Feedback
+### FreeRTOS Task Architecture
 
-### Startup Screen
-- "GETTING READY" message with progress
-- Indicates initialization of camera, display, and SD card
-- Shows credit: "github@barkinsarikartal"
+| Task | Core | Priority | Stack | Responsibility |
+|---|---|---|---|---|
+| taskSDMonitor | 0 | 1 | 4 KB | SD health, free space, removal detection |
+| taskRecorder | 0 | 4 | 8 KB | SD write, I2S audio read, AVI chunk output |
+| taskDisplay | 1 | 3 | 4 KB | TFT frame rendering (ping-pong buffer) |
+| taskCapture | 1 | 5 | 8 KB | Camera capture, state machine, UI events |
+| taskInput | 1 | 2 | 2 KB | Button debounce, input event dispatch |
 
-### Live Viewfinder
-- 320×216 pixel camera feed with RGB565 rendering
-- Bottom status bar (24 pixels):
-  - FPS counter (bottom-left, green text)
-  - SD card status dot (bottom-right: green = ready, red = error)
+**Synchronisation primitives:**
+- `spiMutex` — serialises all SPI bus access (TFT + SD share `SPI2_HOST`)
+- `std::atomic<int>` — dispWriteSlot, dispReadSlot, dispRendering (inter-core display state)
+- `recFrameQueue` — decouples capture from SD write (3-slot PSRAM pool)
+- `recPoolFree` semaphore — backpressure: slows capture when SD is slow
+
+---
+
+## Assembly & Power Notes
+
+Components are soldered on perfboard, powered by a 3.7 V 18650 Li-ion cell.
+
+> **Important:** When powered via the battery connector, the XIAO's 5 V pin is disabled. Connect the **TFT VCC and LED to 3.3 V** to ensure correct operation on battery power.
+
+---
 
 ## Troubleshooting
 
-### Camera Not Initializing
-- Check USB power supply (requires > 500 mA during capture)
-- Verify GPIO pin connections to OV2640 camera module
-- Check Serial output for "Cam init error" message
+| Symptom | Check |
+|---|---|
+| "Cam init error" in serial | USB power ≥ 500 mA; OV2640 ribbon cable seated |
+| Inverted colours on TFT | Toggle `pcfg.invert` in `initCamera()` |
+| SD not detected | FAT32 format; < 32 GB recommended; check GPIO 21 CS |
+| AVI won't play | Use VLC; some players don't support MJPEG in AVI |
 
-### Display Shows Inverted Colors
-- Edit `src/main.cpp` line with `pcfg.invert = true/false`
-- Some ST7789VW modules differ in color polarity
-- Test with `pcfg.invert = false` if colors appear inverted
+---
 
-## Performance Notes
+## Performance
 
-- **Live FPS:** Typically 15–25 FPS on 320×240 RGB565 (depends on how long the microcontroller has been running)
-- **Photo Capture:** ~3–5 seconds total (mode switch + warm-up + save)
-- **Video Recording:** 7–10 FPS achieved (limited by SD card write speed and JPEG encoding)
+| Metric | Typical value |
+|---|---|
+| Viewfinder FPS | 15–25 FPS |
+| Photo save time | 3–5 seconds |
+| Video recording FPS | 9–10 FPS |
+| RAM usage | ~14% of 320 KB |
+| Flash usage | ~19% of 3.3 MB |
+
+---
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+MIT License — see `LICENSE` for details.
