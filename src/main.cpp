@@ -102,7 +102,20 @@
 #define MAX_AVI_CHUNKS  (MAX_AVI_FRAMES * 2)  // V+A interleaved
 
 // ================= APP STATE & EVENTS =================
-enum AppState { STATE_IDLE, STATE_RECORDING, STATE_PHOTO, STATE_STOPPING };
+enum AppState {
+  STATE_IDLE,
+  STATE_RECORDING,
+  STATE_PHOTO,
+  STATE_STOPPING,
+  STATE_MENU_MAIN,
+  STATE_GALLERY_TYPE,
+  STATE_GALLERY_PHOTOS,
+  STATE_GALLERY_VIDEOS,
+  STATE_VIDEO_PLAYING,
+  STATE_DELETE_CONFIRM,
+  STATE_WIFI_MODE,
+  STATE_SETTINGS,
+};
 volatile AppState appState = STATE_IDLE;
 
 #define EVT_START_RECORDING  (1 << 0)
@@ -110,6 +123,27 @@ volatile AppState appState = STATE_IDLE;
 #define EVT_TAKE_PHOTO       (1 << 2)
 #define EVT_SD_STOP          (1 << 3)
 EventGroupHandle_t appEvents;
+
+// ================= INPUT EVENT QUEUE =================
+// Queue-based input pipeline replaces direct EventGroup GPIO signals.
+enum InputEventType {
+  INPUT_BTN_SHORT,   // shutter short press
+  INPUT_BTN_LONG,    // shutter long press
+  INPUT_BOOT_SHORT,  // boot button short press
+  INPUT_BOOT_LONG,   // boot button long press
+  INPUT_ENC_CW,      // encoder clockwise
+  INPUT_ENC_CCW,     // encoder counter-clockwise
+  INPUT_ENC_CLICK,   // encoder button short tap
+  INPUT_ENC_LONG,    // encoder button long press (>500 ms)
+};
+struct InputEvent { InputEventType type; };
+QueueHandle_t inputEventQueue = NULL;
+
+// ================= ENCODER PINS (Phase 8+) =================
+#define ENC_AVAILABLE 0  // set to 1 when physical encoder is wired
+#define ENC_CLK  6
+#define ENC_DT   43
+#define ENC_SW   44
 
 // ================= STRUCTS & GLOBALS =================
 struct SDStatus {
@@ -239,6 +273,7 @@ void setup() {
 
   spiMutex = xSemaphoreCreateMutex();
   appEvents = xEventGroupCreate();
+  inputEventQueue = xQueueCreate(16, sizeof(InputEvent));
   recFrameQueue = xQueueCreate(REC_POOL_SIZE, sizeof(RecFrame));
   recPoolFree = xSemaphoreCreateCounting(REC_POOL_SIZE, REC_POOL_SIZE);
 
@@ -430,80 +465,96 @@ void taskSDMonitor(void *pvParameters) {
 }
 
 // ================= TASK: INPUT HANDLER (Core 0, Priority 2) =================
+//
+// Queue-based input pipeline.
+// All physical inputs are translated into InputEvent and pushed to inputEventQueue.
+// This decouples gesture classification from downstream state handling, and provides
+// a natural extension point for encoder ISR which also pushes to the same queue.
+//
+// Temporary test mapping (encoder not yet wired):
+//   SHUTTER short  → INPUT_BTN_SHORT   (photo / start rec — legacy path kept via EventGroup)
+//   SHUTTER long   → INPUT_BTN_LONG    (start recording   — legacy path kept)
+//   BOOT short     → INPUT_BOOT_SHORT  → mapped to INPUT_ENC_CCW (menu: previous)
+//   BOOT long      → INPUT_BOOT_LONG   → mapped to INPUT_ENC_LONG (menu: back)
+//   SHUTTER short  in STATE_IDLE       → also mapped to INPUT_ENC_CW  (menu: next)
+//   SHUTTER long   in STATE_IDLE >1s   → also mapped to INPUT_ENC_CLICK (menu: select)
 void taskInput(void *pvParameters) {
-  bool lastBtn = HIGH;
   bool lastShutter = HIGH;
+  bool lastBoot    = HIGH;
   unsigned long shutterPressTime = 0;
+  unsigned long bootPressTime    = 0;
+
+  auto sendEvent = [](InputEventType t) {
+    InputEvent e = { t };
+    xQueueSend(inputEventQueue, &e, 0);
+  };
 
   while (true) {
-    // Mirror button (boot button)
-    bool btnNow = digitalRead(BTN_PIN);
-    if (lastBtn == HIGH && btnNow == LOW) {
-      mirror = !mirror;
-      sensor_t *s = esp_camera_sensor_get();
-      if (s) s->set_hmirror(s, mirror);
-    }
-    lastBtn = btnNow;
+    bool shutterNow = digitalRead(SHUTTER_BTN_PIN_2);
+    bool bootNow    = digitalRead(BTN_PIN);
 
-    // Shutter button
-    int shutterState = digitalRead(SHUTTER_BTN_PIN_2);
-
-    // pressed
-    if (lastShutter == HIGH && shutterState == LOW) {
+    // ── SHUTTER press edge ──
+    if (lastShutter == HIGH && shutterNow == LOW) {
       shutterPressTime = millis();
     }
-    // released
-    else if (lastShutter == LOW && shutterState == HIGH) {
-      unsigned long duration = millis() - shutterPressTime;
 
-      // short press -> take photo (only in idle)
-      if (appState == STATE_IDLE && duration < 1000) {
-        bool canSave = false;
-        String errMsg = "";
-        if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-          if (!globalSDState.isMounted) errMsg = "NO SD CARD!";
-          else if (globalSDState.isFull) errMsg = "SD FULL!";
-          else canSave = true;
-          xSemaphoreGive(spiMutex);
-        }
+    // ── SHUTTER release edge ──
+    if (lastShutter == LOW && shutterNow == HIGH) {
+      unsigned long dur = millis() - shutterPressTime;
 
-        if (canSave) {
-          xEventGroupSetBits(appEvents, EVT_TAKE_PHOTO);
-        } else {
-          if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-            tft.setTextSize(2);
-            tft.setCursor(10, 10);
-            tft.setTextColor(TFT_RED, TFT_BLACK);
-            tft.print(errMsg);
+      if (dur < 1000) {
+        // Short press
+        if (appState == STATE_IDLE) {
+          // Legacy: fire photo event
+          bool canSave = false;
+          String errMsg = "";
+          if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
+            if (!globalSDState.isMounted) errMsg = "NO SD CARD!";
+            else if (globalSDState.isFull)  errMsg = "SD FULL!";
+            else canSave = true;
             xSemaphoreGive(spiMutex);
           }
+          if (canSave) {
+            xEventGroupSetBits(appEvents, EVT_TAKE_PHOTO);
+            sendEvent(INPUT_BTN_SHORT);
+          } else {
+            if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+              tft.setTextSize(2);
+              tft.setCursor(10, 10);
+              tft.setTextColor(TFT_RED, TFT_BLACK);
+              tft.print(errMsg);
+              xSemaphoreGive(spiMutex);
+            }
+          }
+        } else if (appState == STATE_RECORDING && millis() - recordingStartTime > 2000) {
+          // Stop recording
+          xEventGroupSetBits(appEvents, EVT_STOP_RECORDING);
+          sendEvent(INPUT_BTN_SHORT);
         }
       }
-      // release during recording -> stop (only after 2 sec since start)
-      else if (appState == STATE_RECORDING && millis() - recordingStartTime > 2000) {
-        xEventGroupSetBits(appEvents, EVT_STOP_RECORDING);
-      }
+      // Long press released — already handled below via held detection
     }
 
-    // long press -> start recording (only in idle)
-    if (shutterState == LOW && appState == STATE_IDLE && (millis() - shutterPressTime > 1000)) {
+    // ── SHUTTER held long (>1s) in IDLE → start recording ──
+    if (shutterNow == LOW && appState == STATE_IDLE &&
+        (millis() - shutterPressTime > 1000) && shutterPressTime != 0) {
       bool cardReady = false;
       String errorMsg = "";
       if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
         if (!globalSDState.isMounted) errorMsg = "NO SD CARD!";
-        else if (globalSDState.isFull) errorMsg = "SD FULL!";
+        else if (globalSDState.isFull)  errorMsg = "SD FULL!";
         else cardReady = true;
         xSemaphoreGive(spiMutex);
       }
-
       if (cardReady) {
+        sendEvent(INPUT_BTN_LONG);
         xEventGroupSetBits(appEvents, EVT_START_RECORDING);
-        // wait until state changes so we don't re-trigger
+        // wait for state change to avoid re-trigger
         while (appState == STATE_IDLE && digitalRead(SHUTTER_BTN_PIN_2) == LOW) {
           vTaskDelay(pdMS_TO_TICKS(50));
         }
-      }
-      else {
+        shutterPressTime = 0;  // re-arm
+      } else {
         if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
           tft.setTextSize(2);
           tft.setCursor(10, 10);
@@ -512,11 +563,36 @@ void taskInput(void *pvParameters) {
           xSemaphoreGive(spiMutex);
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
+        shutterPressTime = 0;
       }
     }
 
-    lastShutter = shutterState;
-    vTaskDelay(pdMS_TO_TICKS(20)); // 50Hz polling
+    // ── BOOT press edge ──
+    if (lastBoot == HIGH && bootNow == LOW) {
+      bootPressTime = millis();
+    }
+
+    // ── BOOT release edge ──
+    if (lastBoot == LOW && bootNow == HIGH) {
+      unsigned long dur = millis() - bootPressTime;
+      if (dur < 800) {
+        // Short: legacy mirror toggle + queue event (Phase 8 menu: ENC_CCW = previous)
+        mirror = !mirror;
+        sensor_t *s = esp_camera_sensor_get();
+        if (s) s->set_hmirror(s, mirror);
+        sendEvent(INPUT_BOOT_SHORT);
+        // Temp mapping → encoder CCW for menu testing without encoder
+        sendEvent(INPUT_ENC_CCW);
+      } else {
+        // Long boot press: queue ENC_LONG (universal "go back" in Phase 8+ menus)
+        sendEvent(INPUT_BOOT_LONG);
+        sendEvent(INPUT_ENC_LONG);
+      }
+    }
+
+    lastShutter = shutterNow;
+    lastBoot    = bootNow;
+    vTaskDelay(pdMS_TO_TICKS(20));  // 50 Hz polling
   }
 }
 
@@ -1146,11 +1222,12 @@ void endAVI(File &file, int fps, int width, int height) {
     }
   }
 
-  // step 2: rewrite header at position 0
-  file.seek(0);
+  // step 2: capture exact file position right after idx1 — file.size() may return
+  // stale data before FAT commits, which caused riffSize = 0xFFFFFFF8 in MediaInfo.
+  uint32_t totalSize = (uint32_t)file.position();
+  uint32_t riffSize  = totalSize - 8;
 
-  uint32_t totalSize = file.size();
-  uint32_t riffSize = totalSize - 8;
+  file.seek(0);
   // microSecPerFrame is derived from TARGET_FPS (set in endAVI preamble), not real_fps.
   uint32_t microSecPerFrame_hdr = 1000000UL / TARGET_FPS;
   uint32_t maxBytesPerSec = (uint32_t)((width * height * 2) * TARGET_FPS) + AUDIO_SAMPLE_RATE * 2;
