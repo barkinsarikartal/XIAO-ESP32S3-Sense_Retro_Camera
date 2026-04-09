@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <LovyanGFX.hpp>
-#include <EEPROM.h>
+#include <Preferences.h>
 #include "esp_camera.h"
 #include "esp_wifi.h"
 #include "esp_bt.h"
@@ -67,10 +67,9 @@
 #define HREF_GPIO_NUM     47
 #define PCLK_GPIO_NUM     13
 
-// ================= EEPROM SETTINGS =================
-#define EEPROM_SIZE       64
-#define EEPROM_ADDR_PIC   0
-#define EEPROM_ADDR_VID   4
+// ================= NVS NAMESPACES =================
+// "cnt" — file counters (pictureNumber, videoNumber)
+// "cam" — camera sensor settings (CameraSettings struct)
 
 // ================= CAMERA SETTINGS =================
 #define PHOTO_MODE        PIXFORMAT_JPEG
@@ -86,7 +85,7 @@
 #define IDLE_JPEG_QUALITY 0
 
 // ================= FIRMWARE VERSION =================
-#define FIRMWARE_VERSION "v0.4"
+#define FIRMWARE_VERSION "v0.5"
 
 // ================= DEBUG FLAGS =================
 // Set to 1 to enable Serial.printf for every InputEvent sent.
@@ -152,10 +151,18 @@ QueueHandle_t inputEventQueue = NULL;
 #define ENC_DT   43
 #define ENC_SW   44
 
-// ISR state — volatile because written in ISR, read in task context.
-// No mutex needed: these are single-word atomic reads on Xtensa.
-volatile uint32_t encLastIsrMs   = 0;  // debounce timestamp for rotation ISR
-volatile uint32_t encSwPressMs   = 0;  // timestamp of SW press edge
+// Quadrature state table — DRAM_ATTR ensures ISR-safe access during flash operations.
+// Index = (prevState << 2) | currState, where state = (CLK << 1) | DT.
+// +1 = CW step, -1 = CCW step, 0 = invalid/bounce (ignored).
+static const DRAM_ATTR int8_t ENC_TABLE[16] = {
+   0, -1,  1,  0,
+   1,  0,  0, -1,
+  -1,  0,  0,  1,
+   0,  1, -1,  0
+};
+volatile uint8_t encPrevState = 3;  // both HIGH at boot (INPUT_PULLUP default)
+volatile int8_t  encAccum     = 0;  // direction accumulator between detents
+volatile uint32_t encSwPressMs = 0; // timestamp of SW button press edge
 
 // Debug counters: ISR increments, taskInput reads and prints the delta.
 // Safe because uint32 reads/writes are atomic on Xtensa; no mutex needed.
@@ -180,6 +187,21 @@ int videoNumber = 0;
 bool mirror = true;
 unsigned long recordingStartTime = 0;
 File videoFile;
+
+// ================= CAMERA SETTINGS =================
+// Persistent camera parameters, loaded from NVS at boot, applied after each initCamera.
+struct CameraSettings {
+  int brightness;     // -2..+2   (default: 1)
+  int contrast;       // -2..+2   (default: 0)
+  int saturation;     // -2..+2   (default: 2)
+  int ae_level;       // -2..+2   (default: 0)
+  int wb_mode;        // 0=Auto 1=Sunny 2=Cloudy 3=Office 4=Home
+  int special_effect; // 0=None 1=Neg 2=Gray 3=Red 4=Green 5=Blue 6=Sepia
+  int hmirror;        // 0/1      (default: 1)
+  int vflip;          // 0/1      (default: 0)
+  int jpeg_quality;   // 4=Max..63=Low, inverse scale (default: 12)
+};
+CameraSettings camSettings = { 1, 0, 2, 0, 0, 0, 1, 0, 12 };
 
 // Single SPI mutex: TFT and SD share the same SPI bus (SPI2_HOST),
 // so all SPI operations must be serialized to prevent bus corruption.
@@ -279,6 +301,9 @@ void initMicrophone();
 void deinitMicrophone();
 void allocateBuffers();
 static void drawStatusBar(float fps);
+void loadCameraSettings();
+void saveCameraSettings();
+void applySettings(sensor_t *s);
 #if ENC_AVAILABLE
 void encoderISR();
 void encSwISR();
@@ -287,7 +312,7 @@ void encSwISR();
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(8000);
 
   esp_wifi_stop();
   esp_bt_controller_disable();
@@ -328,22 +353,18 @@ void setup() {
   tft.drawString("github@barkinsarikartal", tft.width() / 2, 200); // mini ad here :)
   tft.setTextDatum(top_left);
 
-  EEPROM.begin(EEPROM_SIZE);
-
-  pictureNumber = EEPROM.readInt(EEPROM_ADDR_PIC);
-  if (pictureNumber < 0 || pictureNumber > 10000) {
-    pictureNumber = 0;
-    EEPROM.writeInt(EEPROM_ADDR_PIC, pictureNumber);
+  // Load file counters from NVS (replaces EEPROM)
+  {
+    Preferences p;
+    p.begin("cnt", true);  // read-only
+    pictureNumber = p.getInt("pic", 0);
+    videoNumber   = p.getInt("vid", 0);
+    p.end();
   }
 
-  videoNumber = EEPROM.readInt(EEPROM_ADDR_VID);
-  Serial.printf("Initial video no: %d\n", videoNumber);
-  if (videoNumber < 0 || videoNumber > 10000) {
-    videoNumber = 0;
-    EEPROM.writeInt(EEPROM_ADDR_VID, videoNumber);
-  }
-
-  EEPROM.commit();
+  // Load camera settings from NVS
+  loadCameraSettings();
+  mirror = camSettings.hmirror;  // runtime mirror tracks saved preference
 
   Serial.printf("Initial image no: %d, video no: %d\n", pictureNumber, videoNumber);
 
@@ -372,7 +393,7 @@ void setup() {
 
   allocateBuffers();
 
-  delay(8000);
+  delay(2000);
 
   // Task: SD Card Monitor (Core 0, Priority 1)
   xTaskCreatePinnedToCore(taskSDMonitor, "SD_Mon", 4096, NULL, 1, NULL, 0);
@@ -392,8 +413,9 @@ void setup() {
 #if ENC_AVAILABLE
   // Attach encoder interrupts AFTER tasks are created so the queue exists.
   attachInterrupt(digitalPinToInterrupt(ENC_CLK), encoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_DT),  encoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_SW),  encSwISR,  CHANGE);
-  Serial.println("Encoder ISRs attached.");
+  Serial.println("Encoder ISRs attached (CLK+DT+SW).");
 #endif
 
   Serial.println("Cam is ready. Tasks launched.");
@@ -657,28 +679,39 @@ void taskInput(void *pvParameters) {
 // so Phase 5+ menu logic consumes all input from a single source.
 #if ENC_AVAILABLE
 void IRAM_ATTR encoderISR() {
-  // Only react to CLK falling edge — each EC11 detent click produces
-  // exactly one falling edge, eliminating the double-fire that occurred
-  // with CHANGE mode (both rising+falling per detent).
-  if (digitalRead(ENC_CLK)) return;  // rising edge → ignore
+  // Read current 2-bit state: (CLK << 1) | DT
+  uint8_t s = ((uint8_t)digitalRead(ENC_CLK) << 1) | (uint8_t)digitalRead(ENC_DT);
 
-  uint32_t now = millis();
-  if (now - encLastIsrMs < 5) return;  // 5 ms debounce
-  encLastIsrMs = now;
+  // Lookup direction from state transition table
+  int8_t dir = ENC_TABLE[(encPrevState << 2) | s];
+  encPrevState = s;
+  if (dir == 0) return;  // invalid transition (bounce) — discard silently
 
-  // On CLK falling edge: DT HIGH → CW, DT LOW → CCW
-  bool dt = digitalRead(ENC_DT);
-  InputEvent e;
-  e.type = dt ? INPUT_ENC_CW : INPUT_ENC_CCW;
+  encAccum += dir;
 
+  // Emit event only at detent rest position (both pins HIGH = 0b11).
+  // This absorbs all intermediate bounce and partial-rotation noise;
+  // the accumulated direction tells us which way the knob actually moved.
+  if (s == 0b11) {
+    if (encAccum > 0) {
+      InputEvent e = { INPUT_ENC_CW };
 #if DEBUG_INPUT
-  if (e.type == INPUT_ENC_CW) dbgEncCw  = dbgEncCw  + 1;
-  else                        dbgEncCcw = dbgEncCcw + 1;
+      dbgEncCw = dbgEncCw + 1;
 #endif
-
-  BaseType_t woken = pdFALSE;
-  xQueueSendFromISR(inputEventQueue, &e, &woken);
-  if (woken) portYIELD_FROM_ISR();
+      BaseType_t woken = pdFALSE;
+      xQueueSendFromISR(inputEventQueue, &e, &woken);
+      if (woken) portYIELD_FROM_ISR();
+    } else if (encAccum < 0) {
+      InputEvent e = { INPUT_ENC_CCW };
+#if DEBUG_INPUT
+      dbgEncCcw = dbgEncCcw + 1;
+#endif
+      BaseType_t woken = pdFALSE;
+      xQueueSendFromISR(inputEventQueue, &e, &woken);
+      if (woken) portYIELD_FROM_ISR();
+    }
+    encAccum = 0;
+  }
 }
 
 void IRAM_ATTR encSwISR() {
@@ -731,8 +764,7 @@ void taskCapture(void *pvParameters) {
         videoFile = SD.open(path.c_str(), FILE_WRITE);
         if (videoFile) {
           videoNumber++;
-          EEPROM.writeInt(EEPROM_ADDR_VID, videoNumber);
-          EEPROM.commit();
+          { Preferences p; p.begin("cnt", false); p.putInt("vid", videoNumber); p.end(); }
           startAVI(videoFile, 10, 480, 320);
           started = true;
         } else {
@@ -1074,8 +1106,7 @@ void savePhotoHighRes() {
           Serial.println("SUCCESS!");
 
           pictureNumber++;
-          EEPROM.writeInt(EEPROM_ADDR_PIC, pictureNumber);
-          EEPROM.commit();
+          { Preferences p; p.begin("cnt", false); p.putInt("pic", pictureNumber); p.end(); }
           saved = true;
         }
         else {
@@ -1132,7 +1163,7 @@ void initCamera(pixformat_t format, framesize_t size, int jpeg_quality) {
   config.pixel_format = format;
   config.frame_size = size;
   config.jpeg_quality = jpeg_quality;
-  config.fb_count = (format == PIXFORMAT_RGB565) ? 3 : 2;  // fewer JPEG bufs to reduce PSRAM contention
+  config.fb_count = (format == PIXFORMAT_RGB565) ? 3 : 2;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.grab_mode = CAMERA_GRAB_LATEST;
 
@@ -1143,26 +1174,66 @@ void initCamera(pixformat_t format, framesize_t size, int jpeg_quality) {
 
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
-    s->set_brightness(s, 1);
-    s->set_contrast(s, 0);
-    s->set_saturation(s, 2);
+    applySettings(s);
+
+    // These are always-on control flags, not user-tuneable.
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
-    s->set_wb_mode(s, 0);
     s->set_exposure_ctrl(s, 1);
     s->set_aec2(s, 1);
-    s->set_ae_level(s, 0);
 
-    if (format == PIXFORMAT_JPEG) {
+    if (format == PIXFORMAT_JPEG)
       s->set_gainceiling(s, GAINCEILING_16X);
-    }
-    else {
+    else
       s->set_gainceiling(s, GAINCEILING_4X);
-    }
-
-    s->set_hmirror(s, mirror);
   }
   delay(100);
+}
+
+// ================= CAMERA SETTINGS NVS =================
+void loadCameraSettings() {
+  Preferences p;
+  p.begin("cam", true);  // read-only
+  camSettings.brightness    = p.getInt("bright", 1);
+  camSettings.contrast      = p.getInt("contr",  0);
+  camSettings.saturation    = p.getInt("sat",    2);
+  camSettings.ae_level      = p.getInt("ae",     0);
+  camSettings.wb_mode       = p.getInt("wb",     0);
+  camSettings.special_effect = p.getInt("fx",    0);
+  camSettings.hmirror       = p.getInt("hmirr",  1);
+  camSettings.vflip         = p.getInt("vflip",  0);
+  camSettings.jpeg_quality  = p.getInt("jpgq",  12);
+  p.end();
+  Serial.println("[NVS] Camera settings loaded.");
+}
+
+void saveCameraSettings() {
+  Preferences p;
+  p.begin("cam", false);  // read-write
+  p.putInt("bright", camSettings.brightness);
+  p.putInt("contr",  camSettings.contrast);
+  p.putInt("sat",    camSettings.saturation);
+  p.putInt("ae",     camSettings.ae_level);
+  p.putInt("wb",     camSettings.wb_mode);
+  p.putInt("fx",     camSettings.special_effect);
+  p.putInt("hmirr",  camSettings.hmirror);
+  p.putInt("vflip",  camSettings.vflip);
+  p.putInt("jpgq",   camSettings.jpeg_quality);
+  p.end();
+  Serial.println("[NVS] Camera settings saved.");
+}
+
+// Applies CameraSettings to the active sensor. Called after every initCamera.
+void applySettings(sensor_t *s) {
+  if (!s) return;
+  s->set_brightness(s, camSettings.brightness);
+  s->set_contrast(s, camSettings.contrast);
+  s->set_saturation(s, camSettings.saturation);
+  s->set_ae_level(s, camSettings.ae_level);
+  s->set_wb_mode(s, camSettings.wb_mode);
+  s->set_special_effect(s, camSettings.special_effect);
+  s->set_hmirror(s, mirror);  // runtime mirror (toggled by BOOT button)
+  s->set_vflip(s, camSettings.vflip);
 }
 
 // ================= MICROPHONE =================
