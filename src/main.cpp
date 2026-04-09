@@ -85,6 +85,13 @@
 #define REC_JPEG_QUALITY  12
 #define IDLE_JPEG_QUALITY 0
 
+// ================= FIRMWARE VERSION =================
+#define FIRMWARE_VERSION "v0.4"
+
+// ================= DEBUG FLAGS =================
+// Set to 1 to enable Serial.printf for every InputEvent sent.
+#define DEBUG_INPUT 1
+
 // ================= AUDIO SETTINGS =================
 #define AUDIO_SAMPLE_RATE       16000
 #define AUDIO_REC_BUF_SIZE       8192
@@ -139,11 +146,26 @@ enum InputEventType {
 struct InputEvent { InputEventType type; };
 QueueHandle_t inputEventQueue = NULL;
 
-// ================= ENCODER PINS (Phase 8+) =================
-#define ENC_AVAILABLE 0  // set to 1 when physical encoder is wired
+// ================= ENCODER PINS =================
+#define ENC_AVAILABLE 1  // EC11 wired to GPIO6/43/44
 #define ENC_CLK  6
 #define ENC_DT   43
 #define ENC_SW   44
+
+// ISR state — volatile because written in ISR, read in task context.
+// No mutex needed: these are single-word atomic reads on Xtensa.
+volatile uint32_t encLastIsrMs   = 0;  // debounce timestamp for rotation ISR
+volatile uint32_t encSwPressMs   = 0;  // timestamp of SW press edge
+
+// Debug counters: ISR increments, taskInput reads and prints the delta.
+// Safe because uint32 reads/writes are atomic on Xtensa; no mutex needed.
+// These are only active when DEBUG_INPUT=1.
+#if DEBUG_INPUT
+volatile uint32_t dbgEncCw    = 0;
+volatile uint32_t dbgEncCcw   = 0;
+volatile uint32_t dbgEncClick = 0;
+volatile uint32_t dbgEncLong  = 0;
+#endif
 
 // ================= STRUCTS & GLOBALS =================
 struct SDStatus {
@@ -256,6 +278,11 @@ void endAVI(File &file, int fps, int width, int height);
 void initMicrophone();
 void deinitMicrophone();
 void allocateBuffers();
+static void drawStatusBar(float fps);
+#if ENC_AVAILABLE
+void encoderISR();
+void encSwISR();
+#endif
 
 // ================= SETUP =================
 void setup() {
@@ -270,6 +297,12 @@ void setup() {
   pinMode(SHUTTER_BTN_PIN_2, INPUT_PULLUP);
 
   digitalWrite(SHUTTER_BTN_PIN_1, LOW);
+
+#if ENC_AVAILABLE
+  pinMode(ENC_CLK, INPUT_PULLUP);
+  pinMode(ENC_DT,  INPUT_PULLUP);
+  pinMode(ENC_SW,  INPUT_PULLUP);
+#endif
 
   spiMutex = xSemaphoreCreateMutex();
   appEvents = xEventGroupCreate();
@@ -355,6 +388,13 @@ void setup() {
 
   // Task: Camera Capture (Core 1, Priority 6 - highest)
   xTaskCreatePinnedToCore(taskCapture, "Capture", 8192, NULL, 6, NULL, 1);
+
+#if ENC_AVAILABLE
+  // Attach encoder interrupts AFTER tasks are created so the queue exists.
+  attachInterrupt(digitalPinToInterrupt(ENC_CLK), encoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_SW),  encSwISR,  CHANGE);
+  Serial.println("Encoder ISRs attached.");
+#endif
 
   Serial.println("Cam is ready. Tasks launched.");
 }
@@ -487,6 +527,14 @@ void taskInput(void *pvParameters) {
   auto sendEvent = [](InputEventType t) {
     InputEvent e = { t };
     xQueueSend(inputEventQueue, &e, 0);
+#if DEBUG_INPUT
+    // Map enum to readable name for Serial output.
+    static const char* const names[] = {
+      "BTN_SHORT", "BTN_LONG", "BOOT_SHORT", "BOOT_LONG",
+      "ENC_CW",   "ENC_CCW",  "ENC_CLICK",  "ENC_LONG"
+    };
+    Serial.printf("[INPUT] %s\n", (t < 8) ? names[t] : "?");
+#endif
   };
 
   while (true) {
@@ -576,25 +624,84 @@ void taskInput(void *pvParameters) {
     if (lastBoot == LOW && bootNow == HIGH) {
       unsigned long dur = millis() - bootPressTime;
       if (dur < 800) {
-        // Short: legacy mirror toggle + queue event (Phase 8 menu: ENC_CCW = previous)
         mirror = !mirror;
         sensor_t *s = esp_camera_sensor_get();
         if (s) s->set_hmirror(s, mirror);
         sendEvent(INPUT_BOOT_SHORT);
-        // Temp mapping → encoder CCW for menu testing without encoder
-        sendEvent(INPUT_ENC_CCW);
       } else {
-        // Long boot press: queue ENC_LONG (universal "go back" in Phase 8+ menus)
         sendEvent(INPUT_BOOT_LONG);
-        sendEvent(INPUT_ENC_LONG);
       }
     }
 
     lastShutter = shutterNow;
     lastBoot    = bootNow;
+
+#if DEBUG_INPUT
+    // Print ISR-generated encoder events (not routed through sendEvent).
+    // Uses snapshot deltas so we don't miss rapid pulses.
+    static uint32_t lastCw = 0, lastCcw = 0, lastClick = 0, lastLong = 0;
+    uint32_t cw = dbgEncCw, ccw = dbgEncCcw, clk = dbgEncClick, lng = dbgEncLong;
+    if (cw  != lastCw)  { Serial.printf("[ENC] CW  x%lu\n",  cw  - lastCw);  lastCw  = cw;  }
+    if (ccw != lastCcw) { Serial.printf("[ENC] CCW x%lu\n",  ccw - lastCcw); lastCcw = ccw; }
+    if (clk != lastClick) { Serial.printf("[ENC] CLICK\n");                  lastClick = clk; }
+    if (lng != lastLong)  { Serial.printf("[ENC] LONG PRESS\n");              lastLong  = lng; }
+#endif
+
     vTaskDelay(pdMS_TO_TICKS(20));  // 50 Hz polling
   }
 }
+
+// ================= ENCODER ISRs =================
+// Placed in IRAM so they execute even during Flash cache misses (e.g. SD writes).
+// Both ISRs push directly to inputEventQueue — the same queue taskInput uses —
+// so Phase 5+ menu logic consumes all input from a single source.
+#if ENC_AVAILABLE
+void IRAM_ATTR encoderISR() {
+  // Only react to CLK falling edge — each EC11 detent click produces
+  // exactly one falling edge, eliminating the double-fire that occurred
+  // with CHANGE mode (both rising+falling per detent).
+  if (digitalRead(ENC_CLK)) return;  // rising edge → ignore
+
+  uint32_t now = millis();
+  if (now - encLastIsrMs < 5) return;  // 5 ms debounce
+  encLastIsrMs = now;
+
+  // On CLK falling edge: DT HIGH → CW, DT LOW → CCW
+  bool dt = digitalRead(ENC_DT);
+  InputEvent e;
+  e.type = dt ? INPUT_ENC_CW : INPUT_ENC_CCW;
+
+#if DEBUG_INPUT
+  if (e.type == INPUT_ENC_CW) dbgEncCw  = dbgEncCw  + 1;
+  else                        dbgEncCcw = dbgEncCcw + 1;
+#endif
+
+  BaseType_t woken = pdFALSE;
+  xQueueSendFromISR(inputEventQueue, &e, &woken);
+  if (woken) portYIELD_FROM_ISR();
+}
+
+void IRAM_ATTR encSwISR() {
+  uint32_t now = millis();
+  if (digitalRead(ENC_SW) == LOW) {
+    // Falling edge — record press start time.
+    encSwPressMs = now;
+  } else {
+    // Rising edge — reject contact bounce (< 30 ms press is physically impossible).
+    uint32_t dur = now - encSwPressMs;
+    if (dur < 30) return;
+    InputEvent e;
+    e.type = (dur > 500) ? INPUT_ENC_LONG : INPUT_ENC_CLICK;
+#if DEBUG_INPUT
+    if (e.type == INPUT_ENC_LONG) dbgEncLong  = dbgEncLong  + 1;
+    else                          dbgEncClick = dbgEncClick + 1;
+#endif
+    BaseType_t woken = pdFALSE;
+    xQueueSendFromISR(inputEventQueue, &e, &woken);
+    if (woken) portYIELD_FROM_ISR();
+  }
+}
+#endif
 
 // ================= TASK: CAMERA CAPTURE (Core 1, Priority 6) =================
 void taskCapture(void *pvParameters) {
@@ -820,29 +927,40 @@ void taskDisplay(void *pvParameters) {
     uint32_t now = millis();
     if (now - last_fps_time >= 1000) {
       fps = frame_count * 1000.0 / (now - last_fps_time);
-
-      if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(10))) {
-        tft.fillRect(0, 216, 320, 24, TFT_BLACK);
-
-        tft.setTextSize(2);
-        tft.setCursor(8, 220);
-        tft.setTextColor(TFT_GREEN);
-        tft.printf("FPS: %.1f", fps);
-
-        if (globalSDState.isMounted && !globalSDState.isFull) {
-          tft.fillCircle(304, 228, 5, TFT_GREEN);
-        }
-        else {
-          tft.fillCircle(304, 228, 5, TFT_RED);
-        }
-
-        xSemaphoreGive(spiMutex);
-      }
-
+      drawStatusBar(fps);
       frame_count = 0;
       last_fps_time = now;
     }
   }
+}
+
+// Draws the persistent bottom status bar (FPS + version + SD indicator).
+// Called from taskDisplay whenever the 1-second FPS window elapses.
+// Extracted to keep taskDisplay readable and to make version updates trivial.
+static void drawStatusBar(float fps) {
+  if (!xSemaphoreTake(spiMutex, pdMS_TO_TICKS(10))) return;
+
+  tft.fillRect(0, 216, 320, 24, TFT_BLACK);
+
+  // FPS — left side
+  tft.setTextSize(2);
+  tft.setCursor(8, 220);
+  tft.setTextColor(TFT_GREEN);
+  tft.printf("FPS: %.1f", fps);
+
+  // Firmware version — right-center
+  tft.setTextSize(1);
+  tft.setTextColor(0x4208);  // dim grey (RGB565)
+  tft.setCursor(218, 224);
+  tft.print(FIRMWARE_VERSION);
+
+  // SD status dot — far right
+  if (globalSDState.isMounted && !globalSDState.isFull)
+    tft.fillCircle(308, 228, 5, TFT_GREEN);
+  else
+    tft.fillCircle(308, 228, 5, TFT_RED);
+
+  xSemaphoreGive(spiMutex);
 }
 
 // ================= TASK: AVI RECORDER (Core 0, Priority 4) =================
