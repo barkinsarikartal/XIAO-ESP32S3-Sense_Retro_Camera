@@ -11,6 +11,7 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **Live Viewfinder** — Real-time 320×240 RGB565 camera preview on the TFT display
 - **Hardware Mirroring** — Toggle horizontal flip (selfie mode) via the built-in Boot button
 - **FPS Counter & SD Status** — Live overlay showing frame rate and SD card health
+- **WiFi File Server** — AP mode with an embedded HTML file manager to download/delete assets wirelessly
 - **Reliable AVI Encoding** — Accurate `idx1` index table built from actual chunk write order; `microSecPerFrame` derived from declared target FPS, not a variable end-of-recording average
 - **A/V Synchronisation** — I2S DMA geometry tuned to drain exactly one video frame's worth of audio per read (`AUDIO_BYTES_PER_FRAME = 3200` bytes, 10×320-byte DMA slots); fixes cumulative drift
 - **Atomic Multi-Core Synchronisation** — `std::atomic<int>` for all inter-core display-buffer state, preventing SMP data races
@@ -107,6 +108,12 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 
 ### Image Mirroring
 - Press the **Boot button** (GPIO 0) to toggle horizontal flip
+
+### WiFi File Manager
+- **Long press** the **Boot button** (> 800 ms) in Idle mode to enter WiFi AP mode
+- Connect your phone/PC to `Retro_Cam` (password: `barkinsarikartal`)
+- Navigate to `http://192.168.4.1` to download or delete files
+- Press the encoder click/long or Boot long to exit WiFi mode and resume camera
 
 ### SD Card Status
 - **Green dot** (bottom-right) = SD ready
