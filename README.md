@@ -1,6 +1,6 @@
 # XIAO ESP32-S3 Sense Retro Camera
 
-A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Sense. Captures high-resolution photos and MJPEG/PCM audio video, with a live viewfinder on a 2.0" TFT display. Runs a multi-task FreeRTOS architecture for robust, concurrent operation.
+A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Sense. Captures high-resolution photos and MJPEG/PCM audio video, with a live viewfinder on a 2.0" TFT display. Browse photos and play back videos directly on the device via the rotary encoder. Runs a multi-task FreeRTOS architecture for robust, concurrent operation.
 
 ---
 
@@ -12,6 +12,9 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **Hardware Mirroring** — Toggle horizontal flip (selfie mode) via the built-in Boot button
 - **FPS Counter & SD Status** — Live overlay showing frame rate and SD card health
 - **WiFi File Server** — AP mode with an embedded HTML file manager to download/delete assets wirelessly
+- **On-Device Gallery** — Browse photos (JPEG) and videos (AVI) on the TFT with encoder-based navigation
+- **Silent Video Playback** — Plays AVI recordings on the TFT at 10 FPS by parsing MOVI JPEG chunks; pause/resume/stop via encoder
+- **File Deletion** — Delete photos and videos directly from the device with a confirmation dialog
 - **Reliable AVI Encoding** — Accurate `idx1` index table built from actual chunk write order; `microSecPerFrame` derived from declared target FPS, not a variable end-of-recording average
 - **A/V Synchronisation** — I2S DMA geometry tuned to drain exactly one video frame's worth of audio per read (`AUDIO_BYTES_PER_FRAME = 3200` bytes, 10×320-byte DMA slots); fixes cumulative drift
 - **Atomic Multi-Core Synchronisation** — `std::atomic<int>` for all inter-core display-buffer state, preventing SMP data races
@@ -25,6 +28,7 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 |---|---|
 | Microcontroller | Seeed Studio XIAO ESP32-S3 Sense (OV2640 + SD card expansion) |
 | Display | 2.0" TFT LCD — ST7789VW, 240×320, SPI |
+| Rotary Encoder | EC11 with push button (CLK: GPIO 44, DT: GPIO 43, SW: GPIO 6) |
 | Shutter button | 1× tactile button (GPIO 4 / GPIO 5) |
 | Mirror button | Built-in Boot button (GPIO 0) |
 | Storage | MicroSD card, FAT32 formatted |
@@ -120,6 +124,15 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **Red dot** = card missing, full, or error
 - Recording auto-stops if card is removed or full
 
+### Gallery (Photos & Videos)
+- **Encoder click** from Idle → Gallery type selector (Photos / Videos)
+- **CW / CCW** to switch between types, **click** to enter
+- **Long press** to go back at any level
+- **In Photo Gallery:** CW/CCW to browse, click to open action menu (Cancel / Delete)
+- **In Video Gallery:** CW/CCW to browse, click to open action menu (Play / Delete)
+- **During Video Playback:** click to pause/resume, long press to stop and return
+- **File Deletion:** Confirmation dialog with Cancel/Delete before removing from SD
+
 ---
 
 ## Technical Details
@@ -162,9 +175,9 @@ Every video frame always receives one audio chunk (zero-padded if the DMA hasn't
 |---|---|---|---|---|
 | taskSDMonitor | 0 | 1 | 4 KB | SD health, free space, removal detection |
 | taskRecorder | 0 | 4 | 8 KB | SD write, I2S audio read, AVI chunk output |
-| taskDisplay | 1 | 3 | 4 KB | TFT frame rendering (ping-pong buffer) |
+| taskDisplay | 1 | 3 | 4 KB | TFT frame rendering, gallery UI, video playback |
 | taskCapture | 1 | 5 | 8 KB | Camera capture, state machine, UI events |
-| taskInput | 1 | 2 | 2 KB | Button debounce, input event dispatch |
+| taskInput | 0 | 2 | 2 KB | Button/encoder debounce, input event dispatch |
 
 **Synchronisation primitives:**
 - `spiMutex` — serialises all SPI bus access (TFT + SD share `SPI2_HOST`)
@@ -200,8 +213,8 @@ Components are soldered on perfboard, powered by a 3.7 V 18650 Li-ion cell.
 | Viewfinder FPS | 15–25 FPS |
 | Photo save time | 3–5 seconds |
 | Video recording FPS | 9–10 FPS |
-| RAM usage | ~14% of 320 KB |
-| Flash usage | ~19% of 3.3 MB |
+| RAM usage | ~18% of 320 KB |
+| Flash usage | ~38% of 3.3 MB |
 
 ---
 

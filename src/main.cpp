@@ -88,7 +88,7 @@
 #define IDLE_JPEG_QUALITY 0
 
 // ================= FIRMWARE VERSION =================
-#define FIRMWARE_VERSION "v0.6"
+#define FIRMWARE_VERSION "v0.7"
 
 // ================= WIFI AP CONFIG =================
 #define WIFI_SSID "Retro_Cam"
@@ -197,6 +197,16 @@ int videoNumber = 0;
 bool mirror = true;
 unsigned long recordingStartTime = 0;
 File videoFile;
+
+// ================= GALLERY =================
+#define GALLERY_MAX_FILES  2000
+#define GALLERY_NAME_LEN   24
+char **galleryFiles = nullptr;
+int galleryFileCount = 0;
+int galleryIndex = 0;
+int galleryTypeSelection = 0;   // 0=Photos, 1=Videos
+int deleteSelection = 0;        // 0=Cancel, 1=Delete
+volatile bool galleryNeedsRedraw = false;
 
 // ================= CAMERA SETTINGS =================
 // Persistent camera parameters, loaded from NVS at boot, applied after each initCamera.
@@ -316,6 +326,13 @@ void saveCameraSettings();
 void applySettings(sensor_t *s);
 void startWiFiMode();
 void stopWiFiMode();
+void scanGalleryFiles(bool videosOnly);
+void freeGalleryFiles();
+void drawGalleryTypeMenu();
+void drawGalleryPhoto();
+void drawGalleryVideoItem();
+void drawDeleteConfirm();
+void playVideoOnTFT();
 #if ENC_AVAILABLE
 void encoderISR();
 void encSwISR();
@@ -655,40 +672,71 @@ void taskInput(void *pvParameters) {
           // Stop recording
           xEventGroupSetBits(appEvents, EVT_STOP_RECORDING);
           sendEvent(INPUT_BTN_SHORT);
+        } else if (appState == STATE_GALLERY_TYPE || appState == STATE_GALLERY_PHOTOS ||
+                   appState == STATE_GALLERY_VIDEOS || appState == STATE_DELETE_CONFIRM ||
+                   appState == STATE_VIDEO_PLAYING) {
+          // Emergency exit from any gallery/menu state → IDLE
+          Serial.println("[GAL] Shutter short press → exit to IDLE");
+          freeGalleryFiles();
+          initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
+          if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+            tft.fillScreen(TFT_BLACK);
+            xSemaphoreGive(spiMutex);
+          }
+          appState = STATE_IDLE;
         }
       }
       // Long press released — already handled below via held detection
     }
 
-    // ── SHUTTER held long (>1s) in IDLE → start recording ──
-    if (shutterNow == LOW && appState == STATE_IDLE &&
-        (millis() - shutterPressTime > 1000) && shutterPressTime != 0) {
-      bool cardReady = false;
-      String errorMsg = "";
-      if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        if (!globalSDState.isMounted) errorMsg = "NO SD CARD!";
-        else if (globalSDState.isFull)  errorMsg = "SD FULL!";
-        else cardReady = true;
-        xSemaphoreGive(spiMutex);
-      }
-      if (cardReady) {
-        sendEvent(INPUT_BTN_LONG);
-        xEventGroupSetBits(appEvents, EVT_START_RECORDING);
-        // wait for state change to avoid re-trigger
-        while (appState == STATE_IDLE && digitalRead(SHUTTER_BTN_PIN_2) == LOW) {
-          vTaskDelay(pdMS_TO_TICKS(50));
+    // ── SHUTTER held long (>1s) → start recording ──
+    // Works from IDLE or any gallery state (exits gallery first, reinits camera)
+    {
+      AppState cs = appState;
+      bool isGallery = (cs == STATE_GALLERY_TYPE || cs == STATE_GALLERY_PHOTOS ||
+                        cs == STATE_GALLERY_VIDEOS || cs == STATE_DELETE_CONFIRM ||
+                        cs == STATE_VIDEO_PLAYING);
+      if (shutterNow == LOW && (cs == STATE_IDLE || isGallery) &&
+          (millis() - shutterPressTime > 1000) && shutterPressTime != 0) {
+        // Exit gallery first if needed
+        if (isGallery) {
+          Serial.println("[GAL] Shutter long press → exit gallery, start recording");
+          freeGalleryFiles();
+          initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
+          if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+            tft.fillScreen(TFT_BLACK);
+            xSemaphoreGive(spiMutex);
+          }
+          appState = STATE_IDLE;
         }
-        shutterPressTime = 0;  // re-arm
-      } else {
-        if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-          tft.setTextSize(2);
-          tft.setCursor(10, 10);
-          tft.setTextColor(TFT_RED, TFT_BLACK);
-          tft.print(errorMsg);
+
+        bool cardReady = false;
+        String errorMsg = "";
+        if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
+          if (!globalSDState.isMounted) errorMsg = "NO SD CARD!";
+          else if (globalSDState.isFull)  errorMsg = "SD FULL!";
+          else cardReady = true;
           xSemaphoreGive(spiMutex);
         }
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        shutterPressTime = 0;
+        if (cardReady) {
+          sendEvent(INPUT_BTN_LONG);
+          xEventGroupSetBits(appEvents, EVT_START_RECORDING);
+          // wait for state change to avoid re-trigger
+          while (appState == STATE_IDLE && digitalRead(SHUTTER_BTN_PIN_2) == LOW) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+          }
+          shutterPressTime = 0;  // re-arm
+        } else {
+          if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+            tft.setTextSize(2);
+            tft.setCursor(10, 10);
+            tft.setTextColor(TFT_RED, TFT_BLACK);
+            tft.print(errorMsg);
+            xSemaphoreGive(spiMutex);
+          }
+          vTaskDelay(pdMS_TO_TICKS(1000));
+          shutterPressTime = 0;
+        }
       }
     }
 
@@ -719,13 +767,204 @@ void taskInput(void *pvParameters) {
       }
     }
 
-    // ── WiFi mode: encoder click/long exits ──
-    if (appState == STATE_WIFI_MODE) {
+    // ── Process encoder events from ISR queue ──
+    // Unified consumer: all encoder-based state transitions handled here.
+    // Skipped during video playback — playVideoOnTFT() consumes events directly.
+    if (appState != STATE_VIDEO_PLAYING) {
       InputEvent ev;
       while (xQueueReceive(inputEventQueue, &ev, 0) == pdTRUE) {
-        if (ev.type == INPUT_ENC_CLICK || ev.type == INPUT_ENC_LONG) {
-          stopWiFiMode();
-          break;
+        if (ev.type != INPUT_ENC_CW && ev.type != INPUT_ENC_CCW &&
+            ev.type != INPUT_ENC_CLICK && ev.type != INPUT_ENC_LONG) continue;
+
+        switch (appState) {
+          case STATE_IDLE:
+            if (ev.type == INPUT_ENC_CLICK) {
+              if (!globalSDState.isMounted) {
+                // Temporarily block camera rendering so message stays visible
+                appState = STATE_PHOTO;
+                if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+                  tft.fillRect(0, 80, 320, 60, TFT_BLACK);
+                  tft.setTextDatum(middle_center);
+                  tft.setTextSize(2);
+                  tft.setTextColor(TFT_RED);
+                  tft.drawString("NO SD CARD!", tft.width() / 2, 110);
+                  tft.setTextDatum(top_left);
+                  xSemaphoreGive(spiMutex);
+                }
+                vTaskDelay(pdMS_TO_TICKS(1500));
+                appState = STATE_IDLE;
+                break;
+              }
+              galleryTypeSelection = 0;
+              galleryNeedsRedraw = true;
+              // Set state FIRST so taskCapture stops using the camera,
+              // then delay to let any in-progress frame complete,
+              // then deinit. Same pattern as startWiFiMode().
+              appState = STATE_GALLERY_TYPE;
+              vTaskDelay(pdMS_TO_TICKS(150));
+              esp_camera_deinit();
+              Serial.println("[GAL] Camera deinited for gallery");
+              if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+                tft.fillScreen(TFT_BLACK);
+                xSemaphoreGive(spiMutex);
+              }
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            }
+            break;
+
+          case STATE_WIFI_MODE:
+            if (ev.type == INPUT_ENC_CLICK || ev.type == INPUT_ENC_LONG) {
+              stopWiFiMode();
+            }
+            break;
+
+          case STATE_GALLERY_TYPE:
+            if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
+              galleryTypeSelection = 1 - galleryTypeSelection;
+              galleryNeedsRedraw = true;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            } else if (ev.type == INPUT_ENC_CLICK) {
+              if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+                tft.fillRect(0, 200, 320, 20, TFT_BLACK);
+                tft.setTextDatum(middle_center);
+                tft.setTextSize(1);
+                tft.setTextColor(TFT_YELLOW);
+                tft.drawString("Scanning SD card...", tft.width() / 2, 210);
+                tft.setTextDatum(top_left);
+                xSemaphoreGive(spiMutex);
+              }
+              scanGalleryFiles(galleryTypeSelection == 1);
+              if (galleryFileCount > 0) {
+                galleryIndex = 0;
+                galleryNeedsRedraw = true;
+                appState = (galleryTypeSelection == 0) ? STATE_GALLERY_PHOTOS : STATE_GALLERY_VIDEOS;
+              } else {
+                if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+                  tft.fillRect(0, 200, 320, 20, TFT_BLACK);
+                  tft.setTextDatum(middle_center);
+                  tft.setTextSize(1);
+                  tft.setTextColor(TFT_RED);
+                  tft.drawString("No files found", tft.width() / 2, 210);
+                  tft.setTextDatum(top_left);
+                  xSemaphoreGive(spiMutex);
+                }
+              }
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            } else if (ev.type == INPUT_ENC_LONG) {
+              freeGalleryFiles();
+              initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
+              appState = STATE_IDLE;
+              if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+                tft.fillScreen(TFT_BLACK);
+                xSemaphoreGive(spiMutex);
+              }
+            }
+            break;
+
+          case STATE_GALLERY_PHOTOS:
+            if (ev.type == INPUT_ENC_CW) {
+              if (galleryIndex < galleryFileCount - 1) {
+                galleryIndex++;
+                galleryNeedsRedraw = true;
+                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+              }
+            } else if (ev.type == INPUT_ENC_CCW) {
+              if (galleryIndex > 0) {
+                galleryIndex--;
+                galleryNeedsRedraw = true;
+                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+              }
+            } else if (ev.type == INPUT_ENC_CLICK) {
+              deleteSelection = 0;
+              galleryNeedsRedraw = true;
+              appState = STATE_DELETE_CONFIRM;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            } else if (ev.type == INPUT_ENC_LONG) {
+              freeGalleryFiles();
+              galleryNeedsRedraw = true;
+              appState = STATE_GALLERY_TYPE;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            }
+            break;
+
+          case STATE_GALLERY_VIDEOS:
+            if (ev.type == INPUT_ENC_CW) {
+              if (galleryIndex < galleryFileCount - 1) {
+                galleryIndex++;
+                galleryNeedsRedraw = true;
+                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+              }
+            } else if (ev.type == INPUT_ENC_CCW) {
+              if (galleryIndex > 0) {
+                galleryIndex--;
+                galleryNeedsRedraw = true;
+                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+              }
+            } else if (ev.type == INPUT_ENC_CLICK) {
+              deleteSelection = 0;
+              galleryNeedsRedraw = true;
+              appState = STATE_DELETE_CONFIRM;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            } else if (ev.type == INPUT_ENC_LONG) {
+              freeGalleryFiles();
+              galleryNeedsRedraw = true;
+              appState = STATE_GALLERY_TYPE;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            }
+            break;
+
+          case STATE_DELETE_CONFIRM:
+            if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
+              deleteSelection = 1 - deleteSelection;
+              galleryNeedsRedraw = true;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            } else if (ev.type == INPUT_ENC_CLICK) {
+              if (galleryTypeSelection == 1 && deleteSelection == 0) {
+                // Videos: "Play" selected
+                appState = STATE_VIDEO_PLAYING;
+                galleryNeedsRedraw = true;
+                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+              } else if (deleteSelection == 1 && galleryFileCount > 0) {
+                // Delete the file (photos or videos)
+                bool ok = false;
+                if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+                  ok = SD.remove(galleryFiles[galleryIndex]);
+                  xSemaphoreGive(spiMutex);
+                }
+                Serial.printf("[GAL] Delete %s: %s\n", galleryFiles[galleryIndex], ok ? "OK" : "FAIL");
+                if (ok) {
+                  free(galleryFiles[galleryIndex]);
+                  for (int i = galleryIndex; i < galleryFileCount - 1; i++) {
+                    galleryFiles[i] = galleryFiles[i + 1];
+                  }
+                  galleryFileCount--;
+                  if (galleryIndex >= galleryFileCount && galleryIndex > 0) galleryIndex--;
+                }
+                // Return to gallery or type menu if empty
+                if (galleryFileCount > 0) {
+                  appState = (galleryTypeSelection == 0) ? STATE_GALLERY_PHOTOS : STATE_GALLERY_VIDEOS;
+                } else {
+                  freeGalleryFiles();
+                  appState = STATE_GALLERY_TYPE;
+                }
+                galleryNeedsRedraw = true;
+                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+              } else {
+                // Photos: "Cancel" selected (deleteSelection == 0)
+                appState = STATE_GALLERY_PHOTOS;
+                galleryNeedsRedraw = true;
+                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+              }
+            } else if (ev.type == INPUT_ENC_LONG) {
+              // Cancel — go back
+              appState = (galleryTypeSelection == 0) ? STATE_GALLERY_PHOTOS : STATE_GALLERY_VIDEOS;
+              galleryNeedsRedraw = true;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            }
+            break;
+
+          default:
+            break;
         }
       }
     }
@@ -816,10 +1055,15 @@ void taskCapture(void *pvParameters) {
   int fail_count = 0;
 
   while (true) {
-    // Skip capture when camera is deinited (WiFi mode)
-    if (appState == STATE_WIFI_MODE) {
-      vTaskDelay(pdMS_TO_TICKS(100));
-      continue;
+    // Skip capture when camera is deinited (WiFi mode, gallery states)
+    {
+      AppState cs = appState;
+      if (cs == STATE_WIFI_MODE || cs == STATE_GALLERY_TYPE ||
+          cs == STATE_GALLERY_PHOTOS || cs == STATE_GALLERY_VIDEOS ||
+          cs == STATE_DELETE_CONFIRM || cs == STATE_VIDEO_PLAYING) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue;
+      }
     }
 
     // ---- Handle state transition events ----
@@ -947,14 +1191,20 @@ void taskCapture(void *pvParameters) {
     fail_count = 0;
 
     // Copy frame for display (double buffer ping-pong)
-    // Skip if taskDisplay is currently rendering this slot
-    int ws = dispWriteSlot.load();
-    if (ws != dispRendering.load() && fb->len <= FRAME_BUF_SIZE && dispBuf[ws]) {
-      memcpy(dispBuf[ws], fb->buf, fb->len);
-      dispLen[ws] = fb->len;
-      dispReadSlot.store(ws);
-      dispWriteSlot.store(1 - ws);
-      if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+    // Skip during gallery states — dispBuf is reused for JPEG file decode.
+    // Skip if taskDisplay is currently rendering this slot.
+    {
+      AppState cs = appState;
+      if (cs == STATE_IDLE || cs == STATE_RECORDING) {
+        int ws = dispWriteSlot.load();
+        if (ws != dispRendering.load() && fb->len <= FRAME_BUF_SIZE && dispBuf[ws]) {
+          memcpy(dispBuf[ws], fb->buf, fb->len);
+          dispLen[ws] = fb->len;
+          dispReadSlot.store(ws);
+          dispWriteSlot.store(1 - ws);
+          if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+        }
+      }
     }
 
     // Copy frame for recorder (if recording)
@@ -992,6 +1242,29 @@ void taskDisplay(void *pvParameters) {
     // Don't render during photo/stopping/wifi — let notifications stay on screen
     if (appState == STATE_PHOTO || appState == STATE_STOPPING || appState == STATE_WIFI_MODE) {
       vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
+    // Gallery states — render on demand, skip camera preview
+    if (appState == STATE_GALLERY_TYPE || appState == STATE_GALLERY_PHOTOS ||
+        appState == STATE_GALLERY_VIDEOS || appState == STATE_DELETE_CONFIRM) {
+      if (galleryNeedsRedraw) {
+        galleryNeedsRedraw = false;
+        switch (appState) {
+          case STATE_GALLERY_TYPE:   drawGalleryTypeMenu(); break;
+          case STATE_GALLERY_PHOTOS: drawGalleryPhoto(); break;
+          case STATE_GALLERY_VIDEOS: drawGalleryVideoItem(); break;
+          case STATE_DELETE_CONFIRM: drawDeleteConfirm(); break;
+          default: break;
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
+    // Video playback — blocking render loop until stopped
+    if (appState == STATE_VIDEO_PLAYING) {
+      playVideoOnTFT();
       continue;
     }
 
@@ -1983,4 +2256,440 @@ void endAVI(File &file, int fps, int width, int height) {
   // They are boot-allocated and reused across sessions via memset in startAVI().
 
   file.close();
+}
+
+// ================= GALLERY FUNCTIONS =================
+
+// Scan SD root for .jpg or .avi files into PSRAM-backed array.
+// Call freeGalleryFiles() before re-scanning or exiting gallery.
+void scanGalleryFiles(bool videosOnly) {
+  freeGalleryFiles();
+  if (!globalSDState.isMounted) return;
+
+  const char *ext = videosOnly ? ".avi" : ".jpg";
+
+  // Allocate pointer array in PSRAM (2000 * 4 = 8KB — negligible)
+  galleryFiles = (char**)ps_malloc(GALLERY_MAX_FILES * sizeof(char*));
+  if (!galleryFiles) {
+    Serial.println("[GAL] PSRAM alloc failed for file index");
+    return;
+  }
+
+  int count = 0;
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    File root = SD.open("/");
+    if (root) {
+      File f = root.openNextFile();
+      while (f && count < GALLERY_MAX_FILES) {
+        if (!f.isDirectory()) {
+          String name = f.name();
+          if (name.endsWith(ext)) {
+            galleryFiles[count] = (char*)ps_malloc(GALLERY_NAME_LEN);
+            if (galleryFiles[count]) {
+              // f.name() may or may not include leading '/' depending on
+              // ESP32 Arduino core version. Normalize to always have '/'.
+              if (name.startsWith("/")) {
+                strncpy(galleryFiles[count], name.c_str(), GALLERY_NAME_LEN - 1);
+              } else {
+                snprintf(galleryFiles[count], GALLERY_NAME_LEN, "/%s", name.c_str());
+              }
+              galleryFiles[count][GALLERY_NAME_LEN - 1] = '\0';
+              count++;
+            }
+          }
+        }
+        f = root.openNextFile();
+      }
+      root.close();
+    }
+    xSemaphoreGive(spiMutex);
+  }
+
+  galleryFileCount = count;
+  galleryIndex = 0;
+  Serial.printf("[GAL] Found %d %s files\n", count, videosOnly ? "video" : "photo");
+}
+
+// Release gallery file index memory.
+void freeGalleryFiles() {
+  if (galleryFiles) {
+    for (int i = 0; i < galleryFileCount; i++) {
+      if (galleryFiles[i]) free(galleryFiles[i]);
+    }
+    free(galleryFiles);
+    galleryFiles = nullptr;
+  }
+  galleryFileCount = 0;
+  galleryIndex = 0;
+}
+
+// Draw the gallery type selection menu (Photos / Videos).
+void drawGalleryTypeMenu() {
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(middle_center);
+
+    // Title
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_CYAN);
+    tft.drawString("GALLERY", tft.width() / 2, 30);
+
+    // Photos option
+    tft.setTextSize(2);
+    if (galleryTypeSelection == 0) {
+      tft.fillRoundRect(60, 75, 200, 40, 8, TFT_CYAN);
+      tft.setTextColor(TFT_BLACK);
+    } else {
+      tft.drawRoundRect(60, 75, 200, 40, 8, 0x4208);
+      tft.setTextColor(0x7BEF);
+    }
+    tft.drawString("Photos", tft.width() / 2, 95);
+
+    // Videos option
+    tft.setTextSize(2);
+    if (galleryTypeSelection == 1) {
+      tft.fillRoundRect(60, 135, 200, 40, 8, TFT_CYAN);
+      tft.setTextColor(TFT_BLACK);
+    } else {
+      tft.drawRoundRect(60, 135, 200, 40, 8, 0x4208);
+      tft.setTextColor(0x7BEF);
+    }
+    tft.drawString("Videos", tft.width() / 2, 155);
+
+    // Footer hint
+    tft.setTextSize(1);
+    tft.setTextColor(0x4208);
+    tft.drawString("Click: Select  Long: Back", tft.width() / 2, 225);
+
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+}
+
+// Display a single photo from the gallery.
+// Reads JPEG file into dispBuf[0] (safe because taskCapture skips copy during gallery),
+// then decodes with LovyanGFX drawJpg at 0.25f scale (HD 1280x720 -> 320x180).
+void drawGalleryPhoto() {
+  if (galleryFileCount == 0 || galleryIndex >= galleryFileCount) return;
+  if (!globalSDState.isMounted) return;
+
+  const char *filePath = galleryFiles[galleryIndex];
+
+  // Read JPEG into dispBuf[0] (PSRAM, camera copy paused during gallery)
+  uint8_t *jpgBuf = dispBuf[0];
+  size_t jpgLen = 0;
+
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    File f = SD.open(filePath, FILE_READ);
+    if (f) {
+      size_t fsize = f.size();
+      if (fsize <= FRAME_BUF_SIZE && jpgBuf) {
+        jpgLen = f.read(jpgBuf, fsize);
+      }
+      f.close();
+    }
+    xSemaphoreGive(spiMutex);
+  }
+
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(middle_center);
+
+    // Header: index / total
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE);
+    char header[32];
+    snprintf(header, sizeof(header), "%d / %d", galleryIndex + 1, galleryFileCount);
+    tft.drawString(header, tft.width() / 2, 8);
+
+    // Filename (strip leading /)
+    tft.setTextColor(TFT_CYAN);
+    const char *dispName = filePath;
+    if (dispName[0] == '/') dispName++;
+    tft.drawString(dispName, tft.width() / 2, 20);
+
+    if (jpgLen > 0) {
+      // HD (1280x720) at 0.25f = 320x180, drawn at y=30
+      tft.drawJpg(jpgBuf, jpgLen, 0, 30, 320, 180, 0, 0, 0.25f);
+    } else {
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_RED);
+      tft.drawString("Cannot display", tft.width() / 2, 120);
+    }
+
+    // Footer
+    tft.setTextSize(1);
+    tft.setTextColor(0x4208);
+    tft.drawString("Click:Delete  Long:Back", tft.width() / 2, 225);
+
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+}
+
+// Display a single video item with play icon and file info.
+void drawGalleryVideoItem() {
+  if (galleryFileCount == 0 || galleryIndex >= galleryFileCount) return;
+
+  const char *filePath = galleryFiles[galleryIndex];
+
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(middle_center);
+
+    // Header: index / total
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE);
+    char header[32];
+    snprintf(header, sizeof(header), "%d / %d", galleryIndex + 1, galleryFileCount);
+    tft.drawString(header, tft.width() / 2, 10);
+
+    // Play icon (triangle)
+    int cx = tft.width() / 2;
+    tft.fillTriangle(cx - 20, 60, cx - 20, 120, cx + 25, 90, TFT_CYAN);
+
+    // Filename (strip leading /)
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_WHITE);
+    const char *dispName = filePath;
+    if (dispName[0] == '/') dispName++;
+    tft.drawString(dispName, tft.width() / 2, 145);
+
+    // File size
+    float sizeMB = 0;
+    File f = SD.open(filePath, FILE_READ);
+    if (f) {
+      sizeMB = f.size() / 1048576.0f;
+      f.close();
+    }
+    char sizeStr[16];
+    snprintf(sizeStr, sizeof(sizeStr), "%.1f MB", sizeMB);
+    tft.setTextSize(1);
+    tft.setTextColor(0x7BEF);
+    tft.drawString(sizeStr, tft.width() / 2, 170);
+
+    // Footer
+    tft.setTextSize(1);
+    tft.setTextColor(0x4208);
+    tft.drawString("Click:Play  Long:Back", tft.width() / 2, 225);
+
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+}
+
+// Draw the delete confirmation dialog.
+void drawDeleteConfirm() {
+  if (galleryFileCount == 0 || galleryIndex >= galleryFileCount) return;
+
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(middle_center);
+
+    // Title
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_RED);
+    tft.drawString("DELETE FILE?", tft.width() / 2, 30);
+
+    // Filename
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE);
+    const char *dispName = galleryFiles[galleryIndex];
+    if (dispName[0] == '/') dispName++;
+    tft.drawString(dispName, tft.width() / 2, 60);
+
+    // First option: Cancel (photos) or Play (videos)
+    tft.setTextSize(2);
+    bool isVideo = (galleryTypeSelection == 1);
+    if (deleteSelection == 0) {
+      tft.fillRoundRect(60, 90, 200, 40, 8, isVideo ? TFT_CYAN : TFT_GREEN);
+      tft.setTextColor(TFT_BLACK);
+    } else {
+      tft.drawRoundRect(60, 90, 200, 40, 8, 0x4208);
+      tft.setTextColor(0x7BEF);
+    }
+    tft.drawString(isVideo ? "Play" : "Cancel", tft.width() / 2, 110);
+
+    // Delete option
+    tft.setTextSize(2);
+    if (deleteSelection == 1) {
+      tft.fillRoundRect(60, 150, 200, 40, 8, TFT_RED);
+      tft.setTextColor(TFT_WHITE);
+    } else {
+      tft.drawRoundRect(60, 150, 200, 40, 8, 0x4208);
+      tft.setTextColor(0x7BEF);
+    }
+    tft.drawString("Delete", tft.width() / 2, 170);
+
+    // Footer
+    tft.setTextSize(1);
+    tft.setTextColor(0x4208);
+    tft.drawString("Long press: Back", tft.width() / 2, 225);
+
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+}
+
+// Silent AVI video playback on TFT.
+// Parses MOVI LIST for 00dc (JPEG) chunks, skips 01wb (audio) chunks.
+// Uses dispBuf[0] as frame read buffer (safe — camera copy is paused).
+// Runs in taskDisplay context; consumes encoder events for pause/stop.
+void playVideoOnTFT() {
+  if (galleryFileCount == 0 || galleryIndex >= galleryFileCount) {
+    appState = STATE_GALLERY_VIDEOS;
+    galleryNeedsRedraw = true;
+    return;
+  }
+
+  const char *filePath = galleryFiles[galleryIndex];
+
+  File aviFile;
+  bool opened = false;
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    aviFile = SD.open(filePath, FILE_READ);
+    opened = (bool)aviFile;
+    xSemaphoreGive(spiMutex);
+  }
+
+  if (!opened) {
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextDatum(middle_center);
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_RED);
+      tft.drawString("Cannot open file", tft.width() / 2, 110);
+      tft.setTextDatum(top_left);
+      xSemaphoreGive(spiMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    appState = STATE_GALLERY_VIDEOS;
+    galleryNeedsRedraw = true;
+    return;
+  }
+
+  Serial.printf("[GAL] Playing: %s\n", filePath);
+
+  // Clear screen for playback
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    xSemaphoreGive(spiMutex);
+  }
+
+  // Seek past AVI header — MOVI chunk data starts at offset avi_header_size (324)
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    aviFile.seek(avi_header_size);
+    xSemaphoreGive(spiMutex);
+  }
+
+  uint8_t *frameBuf = dispBuf[0];  // reuse display buffer (camera copy paused)
+  uint32_t frameTimeMs = 1000 / TARGET_FPS;  // 100ms per frame
+  bool paused = false;
+  bool stopped = false;
+  int frameNum = 0;
+  int unknownChunks = 0;
+
+  while (!stopped && appState == STATE_VIDEO_PLAYING) {
+    // Check for input events (pause/stop)
+    InputEvent ev;
+    while (xQueueReceive(inputEventQueue, &ev, 0) == pdTRUE) {
+      if (ev.type == INPUT_ENC_CLICK) {
+        paused = !paused;
+        if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(50))) {
+          if (paused) {
+            // Draw pause indicator (two vertical bars)
+            tft.fillRect(145, 5, 30, 20, TFT_BLACK);
+            tft.fillRect(148, 7, 8, 16, TFT_WHITE);
+            tft.fillRect(160, 7, 8, 16, TFT_WHITE);
+          } else {
+            // Clear pause indicator on resume
+            tft.fillRect(145, 5, 30, 20, TFT_BLACK);
+          }
+          xSemaphoreGive(spiMutex);
+        }
+      } else if (ev.type == INPUT_ENC_LONG) {
+        stopped = true;
+      }
+    }
+
+    if (paused) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
+    uint32_t frameStart = millis();
+
+    // ── Single mutex lock: read chunk header + data + draw ──
+    // Batching eliminates 3 extra FreeRTOS context switches per frame.
+    uint8_t tag[4];
+    uint32_t chunkSize = 0;
+    size_t bytesRead = 0;
+    bool endOfData = false;
+
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+      bytesRead = aviFile.read(tag, 4);
+      if (bytesRead == 4) {
+        aviFile.read((uint8_t*)&chunkSize, 4);
+      }
+
+      if (bytesRead < 4) {
+        endOfData = true;
+      } else if (tag[0] == 'i' && tag[1] == 'd' && tag[2] == 'x' && tag[3] == '1') {
+        endOfData = true;
+      }
+      // "00dc" = video frame (JPEG)
+      else if (tag[0] == 0x30 && tag[1] == 0x30 && tag[2] == 0x64 && tag[3] == 0x63) {
+        unknownChunks = 0;
+        if (chunkSize > 0 && chunkSize <= FRAME_BUF_SIZE && frameBuf) {
+          size_t rd = aviFile.read(frameBuf, chunkSize);
+          if (rd == chunkSize) {
+            tft.drawJpg(frameBuf, chunkSize, 40, 40, 240, 160, 0, 0, 0.5f);
+            frameNum++;
+            // Frame counter overlay
+            tft.setTextSize(1);
+            tft.setTextColor(TFT_GREEN, TFT_BLACK);
+            tft.setCursor(4, 4);
+            tft.printf("F:%d", frameNum);
+          }
+        } else {
+          aviFile.seek(aviFile.position() + chunkSize);
+        }
+      }
+      // "01wb" = audio chunk — skip
+      else if (tag[0] == 0x30 && tag[1] == 0x31 && tag[2] == 0x77 && tag[3] == 0x62) {
+        unknownChunks = 0;
+        aviFile.seek(aviFile.position() + chunkSize);
+      }
+      // Unknown chunk — skip
+      else {
+        unknownChunks++;
+        if (unknownChunks > 10) {
+          Serial.println("[GAL] Too many unknown chunks, aborting playback.");
+          endOfData = true;
+        } else {
+          aviFile.seek(aviFile.position() + chunkSize);
+        }
+      }
+      xSemaphoreGive(spiMutex);
+    }
+
+    if (endOfData) break;
+
+    // Frame timing — maintain TARGET_FPS
+    uint32_t elapsed = millis() - frameStart;
+    if (elapsed < frameTimeMs) {
+      vTaskDelay(pdMS_TO_TICKS(frameTimeMs - elapsed));
+    }
+  }
+
+  // Close file and return to video list
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    aviFile.close();
+    xSemaphoreGive(spiMutex);
+  }
+
+  Serial.printf("[GAL] Playback ended. Frames: %d\n", frameNum);
+  appState = STATE_GALLERY_VIDEOS;
+  galleryNeedsRedraw = true;
+  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
 }
