@@ -1,6 +1,6 @@
 # XIAO ESP32-S3 Sense Retro Camera
 
-A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Sense. Captures high-resolution photos and MJPEG/PCM audio video, with a live viewfinder on a 2.0" TFT display. Browse photos and play back videos directly on the device via the rotary encoder. Runs a multi-task FreeRTOS architecture for robust, concurrent operation.
+A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Sense. Captures high-resolution photos and MJPEG/PCM audio video, with a live viewfinder on a 2.0" TFT display. Features a full encoder-driven menu system with on-device gallery, camera settings, and wireless file management. Runs a multi-task FreeRTOS architecture for robust, concurrent operation.
 
 ---
 
@@ -9,6 +9,8 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **High-Resolution Photo Capture** — HD JPEG images (1280×720) saved to SD card
 - **Video Recording with Audio** — MJPEG video at 480×320, 10 FPS, with 16 kHz mono PCM audio via the built-in PDM microphone, saved as `.avi`
 - **Live Viewfinder** — Real-time 320×240 RGB565 camera preview on the TFT display
+- **Main Menu** — Encoder-driven main menu with Gallery, WiFi Transfer, Camera Settings, and Exit options
+- **Camera Settings** — On-device configuration of 9 sensor parameters (brightness, contrast, saturation, AE level, white balance, special effects, mirror, flip, JPEG quality) with NVS persistence
 - **Hardware Mirroring** — Toggle horizontal flip (selfie mode) via the built-in Boot button
 - **FPS Counter & SD Status** — Live overlay showing frame rate and SD card health
 - **WiFi File Server** — AP mode with an embedded HTML file manager to download/delete assets wirelessly
@@ -124,14 +126,30 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **Red dot** = card missing, full, or error
 - Recording auto-stops if card is removed or full
 
+### Menu System
+- **Encoder click** from Idle → Main Menu
+- **Turn** (CW / CCW) to highlight an option, **click** to select
+- **Long press** at any level = go back (universal)
+- Menu items: **Gallery**, **WiFi Transfer**, **Settings**, **Exit**
+
 ### Gallery (Photos & Videos)
-- **Encoder click** from Idle → Gallery type selector (Photos / Videos)
+- Select "Gallery" from the main menu → Gallery type selector (Photos / Videos)
 - **CW / CCW** to switch between types, **click** to enter
-- **Long press** to go back at any level
-- **In Photo Gallery:** CW/CCW to browse, click to open action menu (Cancel / Delete)
-- **In Video Gallery:** CW/CCW to browse, click to open action menu (Play / Delete)
-- **During Video Playback:** click to pause/resume, long press to stop and return
+- **In Photo Gallery:** CW/CCW to browse, click to open delete dialog (Cancel / Delete)
+- **In Video Gallery:** CW/CCW to browse, click to play video directly
+- **During Video Playback:** click to pause/resume, long press to stop → delete dialog
 - **File Deletion:** Confirmation dialog with Cancel/Delete before removing from SD
+- **Shutter button** exits any menu/gallery state immediately (emergency exit)
+
+### Camera Settings
+- Select "Settings" from the main menu
+- **CW / CCW** to browse the 9 parameters (scrollable list)
+- **Click** to enter edit mode (highlighted row turns yellow)
+- **CW / CCW** to adjust the value within its valid range
+- **Click** to confirm and save to NVS
+- **Long press** in edit mode cancels the change
+- **Long press** in browse mode returns to the main menu
+- Available settings: Brightness, Contrast, Saturation, AE Level, White Balance, Special Effect, Mirror, Flip, JPEG Quality
 
 ---
 
@@ -166,18 +184,18 @@ Every video frame always receives one audio chunk (zero-padded if the DMA hasn't
 
 | File | Path pattern | Counter storage |
 |---|---|---|
-| Photo | `/pic_N.jpg` | EEPROM |
-| Video | `/vid_N.avi` | EEPROM |
+| Photo | `/hd_pic_N.jpg` | NVS (`cnt` namespace) |
+| Video | `/vid_N.avi` | NVS (`cnt` namespace) |
 
 ### FreeRTOS Task Architecture
 
 | Task | Core | Priority | Stack | Responsibility |
 |---|---|---|---|---|
 | taskSDMonitor | 0 | 1 | 4 KB | SD health, free space, removal detection |
+| taskInput | 0 | 2 | 4 KB | Button/encoder debounce, menu state machine |
 | taskRecorder | 0 | 4 | 8 KB | SD write, I2S audio read, AVI chunk output |
-| taskDisplay | 1 | 3 | 4 KB | TFT frame rendering, gallery UI, video playback |
-| taskCapture | 1 | 5 | 8 KB | Camera capture, state machine, UI events |
-| taskInput | 0 | 2 | 2 KB | Button/encoder debounce, input event dispatch |
+| taskDisplay | 1 | 3 | 16 KB | TFT frame rendering, menus, gallery UI, video playback |
+| taskCapture | 1 | 6 | 8 KB | Camera capture, state transitions, display/recorder buffer copy |
 
 **Synchronisation primitives:**
 - `spiMutex` — serialises all SPI bus access (TFT + SD share `SPI2_HOST`)

@@ -88,7 +88,7 @@
 #define IDLE_JPEG_QUALITY 0
 
 // ================= FIRMWARE VERSION =================
-#define FIRMWARE_VERSION "v0.7"
+#define FIRMWARE_VERSION "v0.8"
 
 // ================= WIFI AP CONFIG =================
 #define WIFI_SSID "Retro_Cam"
@@ -156,7 +156,6 @@ QueueHandle_t inputEventQueue = NULL;
 AsyncWebServer *webServer = nullptr;
 
 // ================= ENCODER PINS =================
-#define ENC_AVAILABLE 1  // EC11 wired to GPIO6/43/44
 #define ENC_CLK  6
 #define ENC_DT   43
 #define ENC_SW   44
@@ -207,6 +206,18 @@ int galleryIndex = 0;
 int galleryTypeSelection = 0;   // 0=Photos, 1=Videos
 int deleteSelection = 0;        // 0=Cancel, 1=Delete
 volatile bool galleryNeedsRedraw = false;
+
+// ================= MAIN MENU =================
+int menuMainSelection = 0;  // 0=Gallery, 1=WiFi, 2=Settings, 3=Exit
+#define MENU_MAIN_ITEMS 4
+
+// ================= SETTINGS MENU =================
+// Settings parameter descriptors for the encoder-driven settings UI.
+// settingsIndex: which setting is highlighted (0..SETTINGS_COUNT-1)
+// settingsEditing: true when the user is modifying the value (ENC_CW/CCW change value)
+int settingsIndex = 0;
+bool settingsEditing = false;
+#define SETTINGS_COUNT 9
 
 // ================= CAMERA SETTINGS =================
 // Persistent camera parameters, loaded from NVS at boot, applied after each initCamera.
@@ -328,15 +339,17 @@ void startWiFiMode();
 void stopWiFiMode();
 void scanGalleryFiles(bool videosOnly);
 void freeGalleryFiles();
+void drawMenuMain();
 void drawGalleryTypeMenu();
 void drawGalleryPhoto();
 void drawGalleryVideoItem();
 void drawDeleteConfirm();
+void drawSettingsMenu();
 void playVideoOnTFT();
-#if ENC_AVAILABLE
+void enterMenuMain();
+void exitMenuToIdle();
 void encoderISR();
 void encSwISR();
-#endif
 
 // ================= SETUP =================
 void setup() {
@@ -352,11 +365,9 @@ void setup() {
 
   digitalWrite(SHUTTER_BTN_PIN_1, LOW);
 
-#if ENC_AVAILABLE
   pinMode(ENC_CLK, INPUT_PULLUP);
   pinMode(ENC_DT,  INPUT_PULLUP);
   pinMode(ENC_SW,  INPUT_PULLUP);
-#endif
 
   spiMutex = xSemaphoreCreateMutex();
   appEvents = xEventGroupCreate();
@@ -439,13 +450,11 @@ void setup() {
   // Task: Camera Capture (Core 1, Priority 6 - highest)
   xTaskCreatePinnedToCore(taskCapture, "Capture", 8192, NULL, 6, NULL, 1);
 
-#if ENC_AVAILABLE
   // Attach encoder interrupts AFTER tasks are created so the queue exists.
   attachInterrupt(digitalPinToInterrupt(ENC_CLK), encoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_DT),  encoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_SW),  encSwISR,  CHANGE);
   Serial.println("Encoder ISRs attached (CLK+DT+SW).");
-#endif
 
   Serial.println("Cam is ready. Tasks launched.");
 }
@@ -602,16 +611,15 @@ void taskSDMonitor(void *pvParameters) {
 //
 // Queue-based input pipeline.
 // All physical inputs are translated into InputEvent and pushed to inputEventQueue.
-// This decouples gesture classification from downstream state handling, and provides
-// a natural extension point for encoder ISR which also pushes to the same queue.
+// Encoder ISRs push CW/CCW/CLICK/LONG directly; buttons are polled here.
 //
-// Temporary test mapping (encoder not yet wired):
-//   SHUTTER short  → INPUT_BTN_SHORT   (photo / start rec — legacy path kept via EventGroup)
-//   SHUTTER long   → INPUT_BTN_LONG    (start recording   — legacy path kept)
-//   BOOT short     → INPUT_BOOT_SHORT  → mapped to INPUT_ENC_CCW (menu: previous)
-//   BOOT long      → INPUT_BOOT_LONG   → mapped to INPUT_ENC_LONG (menu: back)
-//   SHUTTER short  in STATE_IDLE       → also mapped to INPUT_ENC_CW  (menu: next)
-//   SHUTTER long   in STATE_IDLE >1s   → also mapped to INPUT_ENC_CLICK (menu: select)
+// State machine:
+//   IDLE → ENC_CLICK → MENU_MAIN → (Gallery | WiFi | Settings | Exit)
+//   ENC_LONG = universal "go back one level"
+//   SHUTTER short = photo (IDLE), stop recording, or emergency exit from any menu
+//   SHUTTER long  = start recording (from IDLE or any menu — auto-exits first)
+//   BOOT short    = mirror toggle (IDLE only)
+//   BOOT long     = WiFi mode (IDLE), exit WiFi mode (WIFI_MODE)
 void taskInput(void *pvParameters) {
   bool lastShutter = HIGH;
   bool lastBoot    = HIGH;
@@ -672,11 +680,18 @@ void taskInput(void *pvParameters) {
           // Stop recording
           xEventGroupSetBits(appEvents, EVT_STOP_RECORDING);
           sendEvent(INPUT_BTN_SHORT);
-        } else if (appState == STATE_GALLERY_TYPE || appState == STATE_GALLERY_PHOTOS ||
+        } else if (appState == STATE_MENU_MAIN || appState == STATE_SETTINGS ||
+                   appState == STATE_GALLERY_TYPE || appState == STATE_GALLERY_PHOTOS ||
                    appState == STATE_GALLERY_VIDEOS || appState == STATE_DELETE_CONFIRM ||
                    appState == STATE_VIDEO_PLAYING) {
           // Emergency exit from any gallery/menu state → IDLE
-          Serial.println("[GAL] Shutter short press → exit to IDLE");
+          Serial.println("[MENU] Shutter short press → exit to IDLE");
+          // Revert uncommitted settings edit if active
+          if (settingsEditing) {
+            loadCameraSettings();
+            mirror = camSettings.hmirror;
+            settingsEditing = false;
+          }
           freeGalleryFiles();
           initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
           if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
@@ -693,14 +708,21 @@ void taskInput(void *pvParameters) {
     // Works from IDLE or any gallery state (exits gallery first, reinits camera)
     {
       AppState cs = appState;
-      bool isGallery = (cs == STATE_GALLERY_TYPE || cs == STATE_GALLERY_PHOTOS ||
-                        cs == STATE_GALLERY_VIDEOS || cs == STATE_DELETE_CONFIRM ||
-                        cs == STATE_VIDEO_PLAYING);
-      if (shutterNow == LOW && (cs == STATE_IDLE || isGallery) &&
+      bool isMenu = (cs == STATE_MENU_MAIN || cs == STATE_SETTINGS ||
+                     cs == STATE_GALLERY_TYPE || cs == STATE_GALLERY_PHOTOS ||
+                     cs == STATE_GALLERY_VIDEOS || cs == STATE_DELETE_CONFIRM ||
+                     cs == STATE_VIDEO_PLAYING);
+      if (shutterNow == LOW && (cs == STATE_IDLE || isMenu) &&
           (millis() - shutterPressTime > 1000) && shutterPressTime != 0) {
-        // Exit gallery first if needed
-        if (isGallery) {
-          Serial.println("[GAL] Shutter long press → exit gallery, start recording");
+        // Exit menu/gallery first if needed
+        if (isMenu) {
+          Serial.println("[MENU] Shutter long press -> exit menu, start recording");
+          // Revert uncommitted settings edit if active
+          if (settingsEditing) {
+            loadCameraSettings();
+            mirror = camSettings.hmirror;
+            settingsEditing = false;
+          }
           freeGalleryFiles();
           initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
           if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
@@ -795,20 +817,46 @@ void taskInput(void *pvParameters) {
                 appState = STATE_IDLE;
                 break;
               }
-              galleryTypeSelection = 0;
+
+              menuMainSelection = 0;
               galleryNeedsRedraw = true;
-              // Set state FIRST so taskCapture stops using the camera,
-              // then delay to let any in-progress frame complete,
-              // then deinit. Same pattern as startWiFiMode().
-              appState = STATE_GALLERY_TYPE;
-              vTaskDelay(pdMS_TO_TICKS(150));
-              esp_camera_deinit();
-              Serial.println("[GAL] Camera deinited for gallery");
-              if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-                tft.fillScreen(TFT_BLACK);
-                xSemaphoreGive(spiMutex);
-              }
+              enterMenuMain();
+            }
+            break;
+
+          case STATE_MENU_MAIN:
+            if (ev.type == INPUT_ENC_CW) {
+              menuMainSelection = (menuMainSelection + 1) % MENU_MAIN_ITEMS;
+              galleryNeedsRedraw = true;
               if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            } else if (ev.type == INPUT_ENC_CCW) {
+              menuMainSelection = (menuMainSelection + MENU_MAIN_ITEMS - 1) % MENU_MAIN_ITEMS;
+              galleryNeedsRedraw = true;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            } else if (ev.type == INPUT_ENC_CLICK) {
+              switch (menuMainSelection) {
+                case 0: // Gallery
+                  galleryTypeSelection = 0;
+                  galleryNeedsRedraw = true;
+                  appState = STATE_GALLERY_TYPE;
+                  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                  break;
+                case 1: // WiFi
+                  startWiFiMode();
+                  break;
+                case 2: // Settings
+                  settingsIndex = 0;
+                  settingsEditing = false;
+                  galleryNeedsRedraw = true;
+                  appState = STATE_SETTINGS;
+                  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                  break;
+                case 3: // Exit
+                  exitMenuToIdle();
+                  break;
+              }
+            } else if (ev.type == INPUT_ENC_LONG) {
+              exitMenuToIdle();
             }
             break;
 
@@ -852,12 +900,10 @@ void taskInput(void *pvParameters) {
               if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
             } else if (ev.type == INPUT_ENC_LONG) {
               freeGalleryFiles();
-              initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
-              appState = STATE_IDLE;
-              if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-                tft.fillScreen(TFT_BLACK);
-                xSemaphoreGive(spiMutex);
-              }
+              galleryNeedsRedraw = true;
+              menuMainSelection = 0;
+              appState = STATE_MENU_MAIN;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
             }
             break;
 
@@ -901,9 +947,9 @@ void taskInput(void *pvParameters) {
                 if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
               }
             } else if (ev.type == INPUT_ENC_CLICK) {
-              deleteSelection = 0;
+              // Play video directly
+              appState = STATE_VIDEO_PLAYING;
               galleryNeedsRedraw = true;
-              appState = STATE_DELETE_CONFIRM;
               if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
             } else if (ev.type == INPUT_ENC_LONG) {
               freeGalleryFiles();
@@ -963,6 +1009,75 @@ void taskInput(void *pvParameters) {
             }
             break;
 
+          case STATE_SETTINGS: {
+            // Settings menu: browse or edit camera parameters
+            if (!settingsEditing) {
+              // Browsing mode: CW/CCW move highlight, CLICK enters edit
+              if (ev.type == INPUT_ENC_CW) {
+                settingsIndex = (settingsIndex + 1) % SETTINGS_COUNT;
+                galleryNeedsRedraw = true;
+                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+              } else if (ev.type == INPUT_ENC_CCW) {
+                settingsIndex = (settingsIndex + SETTINGS_COUNT - 1) % SETTINGS_COUNT;
+                galleryNeedsRedraw = true;
+                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+              } else if (ev.type == INPUT_ENC_CLICK) {
+                settingsEditing = true;
+                galleryNeedsRedraw = true;
+                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+              } else if (ev.type == INPUT_ENC_LONG) {
+                // Save and return to main menu
+                saveCameraSettings();
+                galleryNeedsRedraw = true;
+                menuMainSelection = 0;
+                appState = STATE_MENU_MAIN;
+                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+              }
+            } else {
+              // Editing mode: CW/CCW adjust value, CLICK confirms
+              int *val = nullptr;
+              int lo = 0, hi = 0;
+              switch (settingsIndex) {
+                case 0: val = &camSettings.brightness;    lo = -2; hi = 2; break;
+                case 1: val = &camSettings.contrast;      lo = -2; hi = 2; break;
+                case 2: val = &camSettings.saturation;    lo = -2; hi = 2; break;
+                case 3: val = &camSettings.ae_level;      lo = -2; hi = 2; break;
+                case 4: val = &camSettings.wb_mode;       lo = 0;  hi = 4; break;
+                case 5: val = &camSettings.special_effect; lo = 0; hi = 6; break;
+                case 6: val = &camSettings.hmirror;       lo = 0;  hi = 1; break;
+                case 7: val = &camSettings.vflip;         lo = 0;  hi = 1; break;
+                case 8: val = &camSettings.jpeg_quality;  lo = 4;  hi = 63; break;
+              }
+              if (val) {
+                if (ev.type == INPUT_ENC_CW) {
+                  if (*val < hi) (*val)++;
+                  galleryNeedsRedraw = true;
+                  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                } else if (ev.type == INPUT_ENC_CCW) {
+                  if (*val > lo) (*val)--;
+                  galleryNeedsRedraw = true;
+                  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                } else if (ev.type == INPUT_ENC_CLICK) {
+                  // Confirm edit — save to NVS immediately
+                  settingsEditing = false;
+                  saveCameraSettings();
+                  // Update runtime mirror if hmirror changed
+                  if (settingsIndex == 6) mirror = camSettings.hmirror;
+                  galleryNeedsRedraw = true;
+                  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                } else if (ev.type == INPUT_ENC_LONG) {
+                  // Cancel edit — revert to saved
+                  loadCameraSettings();
+                  mirror = camSettings.hmirror;
+                  settingsEditing = false;
+                  galleryNeedsRedraw = true;
+                  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                }
+              }
+            }
+            break;
+          }
+
           default:
             break;
         }
@@ -990,8 +1105,7 @@ void taskInput(void *pvParameters) {
 // ================= ENCODER ISRs =================
 // Placed in IRAM so they execute even during Flash cache misses (e.g. SD writes).
 // Both ISRs push directly to inputEventQueue — the same queue taskInput uses —
-// so Phase 5+ menu logic consumes all input from a single source.
-#if ENC_AVAILABLE
+// so all menu logic consumes from a single source.
 void IRAM_ATTR encoderISR() {
   // Read current 2-bit state: (CLK << 1) | DT
   uint8_t s = ((uint8_t)digitalRead(ENC_CLK) << 1) | (uint8_t)digitalRead(ENC_DT);
@@ -1048,7 +1162,6 @@ void IRAM_ATTR encSwISR() {
     if (woken) portYIELD_FROM_ISR();
   }
 }
-#endif
 
 // ================= TASK: CAMERA CAPTURE (Core 1, Priority 6) =================
 void taskCapture(void *pvParameters) {
@@ -1058,9 +1171,10 @@ void taskCapture(void *pvParameters) {
     // Skip capture when camera is deinited (WiFi mode, gallery states)
     {
       AppState cs = appState;
-      if (cs == STATE_WIFI_MODE || cs == STATE_GALLERY_TYPE ||
-          cs == STATE_GALLERY_PHOTOS || cs == STATE_GALLERY_VIDEOS ||
-          cs == STATE_DELETE_CONFIRM || cs == STATE_VIDEO_PLAYING) {
+      if (cs == STATE_WIFI_MODE || cs == STATE_MENU_MAIN || cs == STATE_SETTINGS ||
+          cs == STATE_GALLERY_TYPE || cs == STATE_GALLERY_PHOTOS ||
+          cs == STATE_GALLERY_VIDEOS || cs == STATE_DELETE_CONFIRM ||
+          cs == STATE_VIDEO_PLAYING) {
         vTaskDelay(pdMS_TO_TICKS(100));
         continue;
       }
@@ -1245,12 +1359,15 @@ void taskDisplay(void *pvParameters) {
       continue;
     }
 
-    // Gallery states — render on demand, skip camera preview
-    if (appState == STATE_GALLERY_TYPE || appState == STATE_GALLERY_PHOTOS ||
+    // Menu and gallery states — render on demand, skip camera preview
+    if (appState == STATE_MENU_MAIN || appState == STATE_SETTINGS ||
+        appState == STATE_GALLERY_TYPE || appState == STATE_GALLERY_PHOTOS ||
         appState == STATE_GALLERY_VIDEOS || appState == STATE_DELETE_CONFIRM) {
       if (galleryNeedsRedraw) {
         galleryNeedsRedraw = false;
         switch (appState) {
+          case STATE_MENU_MAIN:      drawMenuMain(); break;
+          case STATE_SETTINGS:       drawSettingsMenu(); break;
           case STATE_GALLERY_TYPE:   drawGalleryTypeMenu(); break;
           case STATE_GALLERY_PHOTOS: drawGalleryPhoto(); break;
           case STATE_GALLERY_VIDEOS: drawGalleryVideoItem(); break;
@@ -2258,6 +2375,187 @@ void endAVI(File &file, int fps, int width, int height) {
   file.close();
 }
 
+// ================= MENU HELPERS =================
+
+// Enter main menu from IDLE: deinit camera, set state, trigger redraw.
+// Camera is powered down during menu navigation to free PSRAM and reduce power.
+void enterMenuMain() {
+  appState = STATE_MENU_MAIN;
+  vTaskDelay(pdMS_TO_TICKS(150));
+  esp_camera_deinit();
+  Serial.println("[MENU] Camera deinited for menu");
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    xSemaphoreGive(spiMutex);
+  }
+  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+}
+
+// Exit menu back to IDLE: reinit camera, clear screen.
+void exitMenuToIdle() {
+  freeGalleryFiles();
+  initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    xSemaphoreGive(spiMutex);
+  }
+  appState = STATE_IDLE;
+}
+
+// Draw the main menu (Gallery / WiFi / Settings / Exit).
+void drawMenuMain() {
+  static const char* const labels[MENU_MAIN_ITEMS] = {
+    "Gallery", "WiFi Transfer", "Settings", "Exit"
+  };
+  // Accent colours per item for visual variety
+  static const uint16_t accents[MENU_MAIN_ITEMS] = {
+    TFT_CYAN, TFT_YELLOW, TFT_ORANGE, 0x7BEF  // cyan, yellow, orange, grey
+  };
+
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(middle_center);
+
+    // Title
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("MENU", tft.width() / 2, 22);
+
+    // Menu items
+    int yStart = 55;
+    int itemH = 38;
+    for (int i = 0; i < MENU_MAIN_ITEMS; i++) {
+      int y = yStart + i * itemH;
+      if (i == menuMainSelection) {
+        tft.fillRoundRect(50, y, 220, 32, 8, accents[i]);
+        tft.setTextSize(2);
+        tft.setTextColor(TFT_BLACK);
+      } else {
+        tft.drawRoundRect(50, y, 220, 32, 8, 0x4208);
+        tft.setTextSize(2);
+        tft.setTextColor(0x7BEF);
+      }
+      tft.drawString(labels[i], tft.width() / 2, y + 16);
+    }
+
+    // Footer hint
+    tft.setTextSize(1);
+    tft.setTextColor(0x4208);
+    tft.drawString("Click: Select  Long: Exit", tft.width() / 2, 225);
+
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+}
+
+// Draw the camera settings menu.
+// Shows all 9 settings with current values; the highlighted item is shown
+// with inverted colours. In editing mode, the value flashes with a different
+// background to indicate it can be changed with CW/CCW.
+void drawSettingsMenu() {
+  // Human-readable labels matching CameraSettings struct field order
+  static const char* const names[SETTINGS_COUNT] = {
+    "Bright", "Contr", "Satur", "AE Lv",
+    "WB", "FX", "Mirror", "Flip", "JPEG Q"
+  };
+  // White balance mode labels
+  static const char* const wbLabels[] = {
+    "Auto", "Sunny", "Cloud", "Office", "Home"
+  };
+  // Special effect labels
+  static const char* const fxLabels[] = {
+    "None", "Neg", "Gray", "Red", "Green", "Blue", "Sepia"
+  };
+
+  // Read current values from camSettings into an array for uniform rendering
+  int vals[SETTINGS_COUNT] = {
+    camSettings.brightness, camSettings.contrast, camSettings.saturation,
+    camSettings.ae_level, camSettings.wb_mode, camSettings.special_effect,
+    camSettings.hmirror, camSettings.vflip, camSettings.jpeg_quality
+  };
+
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(middle_center);
+
+    // Title
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_ORANGE);
+    tft.drawString("SETTINGS", tft.width() / 2, 14);
+
+    // Visible window: show up to 7 items at a time with scrolling
+    int visibleItems = 7;
+    int itemH = 25;
+    int yStart = 34;
+
+    // Calculate scroll window so the selected item stays visible
+    int scrollTop = 0;
+    if (settingsIndex >= visibleItems) {
+      scrollTop = settingsIndex - visibleItems + 1;
+    }
+
+    for (int v = 0; v < visibleItems && (scrollTop + v) < SETTINGS_COUNT; v++) {
+      int i = scrollTop + v;
+      int y = yStart + v * itemH;
+      bool selected = (i == settingsIndex);
+      bool editing = selected && settingsEditing;
+
+      // Background
+      if (editing) {
+        tft.fillRoundRect(4, y, 312, 22, 4, TFT_YELLOW);
+      } else if (selected) {
+        tft.fillRoundRect(4, y, 312, 22, 4, TFT_CYAN);
+      }
+
+      // Label (left)
+      tft.setTextDatum(middle_left);
+      tft.setTextSize(1);
+      tft.setTextColor((selected || editing) ? TFT_BLACK : TFT_WHITE);
+      tft.drawString(names[i], 10, y + 11);
+
+      // Value (right)
+      tft.setTextDatum(middle_right);
+      char valBuf[16];
+      if (i == 4) {
+        // WB mode — show label
+        snprintf(valBuf, sizeof(valBuf), "%s", wbLabels[constrain(vals[i], 0, 4)]);
+      } else if (i == 5) {
+        // FX — show label
+        snprintf(valBuf, sizeof(valBuf), "%s", fxLabels[constrain(vals[i], 0, 6)]);
+      } else if (i == 6 || i == 7) {
+        // Boolean — show On/Off
+        snprintf(valBuf, sizeof(valBuf), "%s", vals[i] ? "On" : "Off");
+      } else {
+        snprintf(valBuf, sizeof(valBuf), "%d", vals[i]);
+      }
+      tft.setTextColor((selected || editing) ? TFT_BLACK : TFT_GREEN);
+      tft.drawString(valBuf, 310, y + 11);
+    }
+
+    // Scroll indicators
+    tft.setTextDatum(middle_center);
+    tft.setTextSize(1);
+    tft.setTextColor(0x4208);
+    if (scrollTop > 0) {
+      tft.drawString("^", tft.width() / 2, yStart - 6);
+    }
+    if (scrollTop + visibleItems < SETTINGS_COUNT) {
+      tft.drawString("v", tft.width() / 2, yStart + visibleItems * itemH + 2);
+    }
+
+    // Footer hint
+    tft.setTextColor(0x4208);
+    if (settingsEditing) {
+      tft.drawString("Turn: Value  Click: OK  Long: Cancel", tft.width() / 2, 225);
+    } else {
+      tft.drawString("Turn: Browse  Click: Edit  Long: Back", tft.width() / 2, 225);
+    }
+
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+}
+
 // ================= GALLERY FUNCTIONS =================
 
 // Scan SD root for .jpg or .avi files into PSRAM-backed array.
@@ -2688,8 +2986,16 @@ void playVideoOnTFT() {
     xSemaphoreGive(spiMutex);
   }
 
-  Serial.printf("[GAL] Playback ended. Frames: %d\n", frameNum);
-  appState = STATE_GALLERY_VIDEOS;
+  Serial.printf("[GAL] Playback ended. Frames: %d, stopped: %d\n", frameNum, (int)stopped);
+
+  if (stopped) {
+    // User pressed ENC_LONG during playback → offer delete
+    deleteSelection = 0;
+    appState = STATE_DELETE_CONFIRM;
+  } else {
+    // Natural EOF — return to video list
+    appState = STATE_GALLERY_VIDEOS;
+  }
   galleryNeedsRedraw = true;
   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
 }
