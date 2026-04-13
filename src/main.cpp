@@ -17,6 +17,7 @@
 #include "freertos/event_groups.h"
 #include "driver/i2s_pdm.h"
 #include <atomic>
+#include <memory>
 
 //   TFT Pin         ->     XIAO ESP32-S3
 //     VCC           ->          3V3
@@ -468,6 +469,49 @@ void allocateBuffers() {
 // ================= TASK: SD MONITOR (Core 0, Priority 1) =================
 void taskSDMonitor(void *pvParameters) {
   while (true) {
+    // WiFi mode: lightweight SD presence check only.
+    // Skip remount attempts (SD.end/begin) to avoid colliding with active downloads.
+    // Update globalSDState so web routes return correct errors if SD removed.
+    // Update TFT status so user can see SD state without browser.
+    if (appState == STATE_WIFI_MODE) {
+      if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        bool wasMounted = globalSDState.isMounted;
+        if (SD.cardType() == CARD_NONE || SD.totalBytes() == 0) {
+          globalSDState.isMounted = false;
+          globalSDState.isFull = false;
+          globalSDState.errorMsg = "SD REMOVED";
+        } else {
+          globalSDState.isMounted = true;
+          uint64_t freeBytes = SD.totalBytes() - SD.usedBytes();
+          globalSDState.isFull = (freeBytes < 10 * 1024 * 1024);
+          globalSDState.errorMsg = globalSDState.isFull ? "SD FULL" : "READY";
+        }
+        xSemaphoreGive(spiMutex);
+
+        // SD state changed — update TFT bottom bar
+        if (wasMounted != globalSDState.isMounted) {
+          if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(200))) {
+            tft.fillRect(0, 210, 320, 30, TFT_BLACK);
+            tft.setTextDatum(middle_center);
+            tft.setTextSize(1);
+            if (!globalSDState.isMounted) {
+              tft.setTextColor(TFT_RED);
+              tft.drawString("! SD CARD REMOVED !", tft.width() / 2, 220);
+              Serial.println("[WIFI] SD card removed during WiFi mode.");
+            } else {
+              tft.setTextColor(0x7BEF);
+              tft.drawString("Press to exit", tft.width() / 2, 220);
+              Serial.println("[WIFI] SD card re-inserted during WiFi mode.");
+            }
+            tft.setTextDatum(top_left);
+            xSemaphoreGive(spiMutex);
+          }
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(3000));
+      continue;
+    }
+
     if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
 
       // during recording: only check free space
@@ -1274,7 +1318,7 @@ void applySettings(sensor_t *s) {
 }
 
 // ================= WIFI FILE SERVER =================
-// Embedded HTML — mobile-first dark theme file manager.
+// Embedded HTML — mobile-first dark theme file manager with photo thumbnails.
 // Served from PROGMEM to avoid PSRAM/heap allocation for static content.
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -1290,16 +1334,19 @@ h1{font-size:1.4em;margin-bottom:12px;color:#fff}
 .bar{background:#222;border-radius:8px;overflow:hidden;height:24px;margin-bottom:16px;position:relative}
 .bar-fill{height:100%;background:linear-gradient(90deg,#2ecc71,#27ae60);transition:width .3s}
 .bar-text{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:.8em;color:#fff;white-space:nowrap}
-.file{display:flex;align-items:center;justify-content:space-between;background:#1a1a1a;border-radius:8px;padding:10px 12px;margin-bottom:8px;border:1px solid #2a2a2a}
-.file-info{flex:1;min-width:0}
+.file{display:flex;align-items:center;background:#1a1a1a;border-radius:8px;padding:10px 12px;margin-bottom:8px;border:1px solid #2a2a2a}
+.thumb{width:80px;height:45px;border-radius:4px;object-fit:cover;flex-shrink:0;background:#222}
+.vid-thumb{width:80px;height:45px;border-radius:4px;flex-shrink:0;background:#222;display:flex;align-items:center;justify-content:center;font-size:1.6em;color:#666}
+.file-info{flex:1;min-width:0;margin-left:10px}
 .file-name{font-size:.9em;word-break:break-all;color:#fff}
 .file-size{font-size:.75em;color:#888;margin-top:2px}
 .btns{display:flex;gap:6px;margin-left:8px;flex-shrink:0}
-.btn{border:none;padding:8px 12px;border-radius:6px;cursor:pointer;font-size:.8em;font-weight:600}
+.btn{border:none;padding:8px 12px;border-radius:6px;cursor:pointer;font-size:.8em;font-weight:600;text-decoration:none;text-align:center}
 .btn-dl{background:#2980b9;color:#fff}
 .btn-del{background:#c0392b;color:#fff}
 .btn:active{opacity:.7}
 .empty{text-align:center;color:#666;padding:40px 0}
+.err{text-align:center;color:#e74c3c;padding:30px 0;font-size:.9em}
 .modal-bg{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:10;align-items:center;justify-content:center}
 .modal-bg.show{display:flex}
 .modal{background:#222;border-radius:12px;padding:24px;max-width:320px;width:90%;text-align:center}
@@ -1318,24 +1365,29 @@ h1{font-size:1.4em;margin-bottom:12px;color:#fff}
 let delTarget='';
 function load(){
  fetch('/api/info').then(r=>r.json()).then(d=>{
+  if(d.error){document.getElementById('barText').textContent='SD card unavailable';return;}
   let pct=((d.used/d.total)*100).toFixed(1);
   document.getElementById('barFill').style.width=pct+'%';
   let fmt=b=>(b/1048576).toFixed(1)+' MB';
   document.getElementById('barText').textContent=fmt(d.used)+' / '+fmt(d.total)+' ('+fmt(d.free)+' free)';
- });
+ }).catch(()=>{document.getElementById('barText').textContent='Connection error';});
  fetch('/api/files').then(r=>r.json()).then(files=>{
   let el=document.getElementById('list');
+  if(files.error){el.innerHTML='<div class="err">'+files.error+'</div>';return;}
   if(!files.length){el.innerHTML='<div class="empty">No files on SD card</div>';return;}
   let h='';
   files.forEach(f=>{
    let sz=f.size<1048576?(f.size/1024).toFixed(1)+' KB':(f.size/1048576).toFixed(1)+' MB';
-   h+='<div class="file"><div class="file-info"><div class="file-name">'+f.name+'</div><div class="file-size">'+sz+'</div></div><div class="btns">';
-   h+='<a class="btn btn-dl" href="/api/download?file='+encodeURIComponent(f.name)+'">&#11015;</a>';
+   h+='<div class="file">';
+   if(f.isVideo){h+='<div class="vid-thumb">&#127916;</div>';}
+   else{h+='<img class="thumb" loading="lazy" src="/api/preview?file='+encodeURIComponent(f.name)+'" alt="">';}
+   h+='<div class="file-info"><div class="file-name">'+f.name+'</div><div class="file-size">'+sz+'</div></div><div class="btns">';
+   h+='<a class="btn btn-dl" download href="/api/download?file='+encodeURIComponent(f.name)+'">&#11015;</a>';
    h+='<button class="btn btn-del" onclick="confirmDel(\''+f.name.replace(/'/g,"\\'")+'\')">&#128465;</button>';
    h+='</div></div>';
   });
   el.innerHTML=h;
- });
+ }).catch(()=>{document.getElementById('list').innerHTML='<div class="err">Connection error</div>';});
 }
 function confirmDel(name){delTarget=name;document.getElementById('modalMsg').textContent='Delete '+name+'?';document.getElementById('modalBg').classList.add('show');}
 function closeModal(){document.getElementById('modalBg').classList.remove('show');delTarget='';}
@@ -1384,10 +1436,14 @@ void startWiFiMode() {
     request->send(200, "text/html", INDEX_HTML);
   });
 
-  // Route: SD info JSON
+  // Route: SD info JSON — validates SD mount before access
   webServer->on("/api/info", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!globalSDState.isMounted) {
+      request->send(200, "application/json", "{\"error\":\"SD card not mounted\",\"total\":0,\"used\":0,\"free\":0}");
+      return;
+    }
     uint64_t total = 0, used = 0;
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(500))) {
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
       total = SD.totalBytes();
       used  = SD.usedBytes();
       xSemaphoreGive(spiMutex);
@@ -1399,11 +1455,15 @@ void startWiFiMode() {
     request->send(200, "application/json", buf);
   });
 
-  // Route: file list JSON
+  // Route: file list JSON — validates SD mount before scan
   webServer->on("/api/files", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!globalSDState.isMounted) {
+      request->send(200, "application/json", "{\"error\":\"SD card not mounted\"}");
+      return;
+    }
     String json = "[";
     bool first = true;
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(1000))) {
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
       File root = SD.open("/");
       if (root) {
         File f = root.openNextFile();
@@ -1433,65 +1493,113 @@ void startWiFiMode() {
     request->send(200, "application/json", json);
   });
 
-  // Route: download file (chunked stream, spiMutex per chunk)
+  // Route: download file (chunked stream, forced download via HTML download attr)
+  // Uses shared_ptr<File> so the file is auto-closed if client disconnects mid-transfer.
   webServer->on("/api/download", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!request->hasParam("file")) {
       request->send(400, "text/plain", "Missing file param");
       return;
     }
+    if (!globalSDState.isMounted) {
+      request->send(503, "text/plain", "SD card not mounted");
+      return;
+    }
     String filename = request->getParam("file")->value();
     if (!filename.startsWith("/")) filename = "/" + filename;
 
-    // Open file with mutex
-    File *fp = new File();
+    // Open file with mutex — shared_ptr ensures RAII cleanup
+    auto fp = std::make_shared<File>();
     bool opened = false;
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(1000))) {
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
       *fp = SD.open(filename, FILE_READ);
       opened = (bool)*fp;
       xSemaphoreGive(spiMutex);
     }
     if (!opened) {
-      delete fp;
       request->send(404, "text/plain", "File not found");
       return;
     }
 
     String contentType = filename.endsWith(".jpg") ? "image/jpeg" : "application/octet-stream";
-    // Extract just the filename for Content-Disposition
-    String basename = filename;
-    if (basename.startsWith("/")) basename = basename.substring(1);
 
     AsyncWebServerResponse *response = request->beginChunkedResponse(
       contentType.c_str(),
-      [fp](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
+      [fp](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
         if (!*fp) return 0;
         size_t bytesRead = 0;
-        if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(500))) {
+        if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
           bytesRead = fp->read(buffer, maxLen);
           if (bytesRead == 0) {
             fp->close();
-            delete fp;
           }
           xSemaphoreGive(spiMutex);
         }
         return bytesRead;
       }
     );
-    response->addHeader("Content-Disposition", "attachment; filename=\"" + basename + "\"");
     request->send(response);
   });
 
-  // Route: delete file
+  // Route: preview file inline (for thumbnail <img> tags — no Content-Disposition)
+  webServer->on("/api/preview", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("file")) {
+      request->send(400, "text/plain", "Missing file param");
+      return;
+    }
+    if (!globalSDState.isMounted) {
+      request->send(503, "text/plain", "SD not mounted");
+      return;
+    }
+    String filename = request->getParam("file")->value();
+    if (!filename.startsWith("/")) filename = "/" + filename;
+
+    auto fp = std::make_shared<File>();
+    bool opened = false;
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+      *fp = SD.open(filename, FILE_READ);
+      opened = (bool)*fp;
+      xSemaphoreGive(spiMutex);
+    }
+    if (!opened) {
+      request->send(404, "text/plain", "Not found");
+      return;
+    }
+
+    AsyncWebServerResponse *response = request->beginChunkedResponse(
+      "image/jpeg",
+      [fp](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+        if (!*fp) return 0;
+        size_t bytesRead = 0;
+        if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+          bytesRead = fp->read(buffer, maxLen);
+          if (bytesRead == 0) {
+            fp->close();
+          }
+          xSemaphoreGive(spiMutex);
+        }
+        return bytesRead;
+      }
+    );
+    // Cache thumbnails in browser for 5 min — avoid re-downloading on page reload
+    response->addHeader("Cache-Control", "max-age=300");
+    request->send(response);
+  });
+
+  // Route: delete file — validates SD mount
   webServer->on("/api/delete", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!request->hasParam("file")) {
       request->send(400, "application/json", "{\"ok\":false,\"msg\":\"Missing file param\"}");
+      return;
+    }
+    if (!globalSDState.isMounted) {
+      request->send(200, "application/json", "{\"ok\":false,\"msg\":\"SD card not mounted\"}");
       return;
     }
     String filename = request->getParam("file")->value();
     if (!filename.startsWith("/")) filename = "/" + filename;
 
     bool ok = false;
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(1000))) {
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
       ok = SD.remove(filename);
       xSemaphoreGive(spiMutex);
     }
