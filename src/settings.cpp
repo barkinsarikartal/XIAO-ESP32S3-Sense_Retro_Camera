@@ -49,6 +49,31 @@ void applySettings(sensor_t *s) {
   s->set_special_effect(s, camSettings.special_effect);
   s->set_hmirror(s, camSettings.hmirror);
   s->set_vflip(s, camSettings.vflip);
+
+  // OV2640 SDE saturation boost — direct register access, bypasses the API ceiling of +2.
+  // The esp-idf set_saturation() API only sets U_SAT/V_SAT to ~0x68 at level +2, which is
+  // noticeably less saturated than a modern phone camera. We override those values AND
+  // ensure the SDE enable mask has bit 0 (saturation) and bit 1 (saturation boost) set,
+  // otherwise the U_SAT/V_SAT values are silently ignored by the DSP.
+  //
+  // SDE control byte 0x00 bitmask:
+  //   bit 0 = Saturation + Hue enable
+  //   bit 1 = Saturation boost enable
+  //   bit 2 = Brightness + Contrast enable
+  // We set 0x07 to keep sat+boost+brightness/contrast all active.
+  //
+  // Register sequence via indirect BPADDR(0x7C) / BPDATA(0x7D):
+  //   1. Switch to DSP bank (0xFF = 0x00)
+  //   2. Write enable mask → address 0x00, data 0x07
+  //   3. Write U_SAT       → address 0x03, data 0x88
+  //   4. Write V_SAT       → address 0x04, data 0x88
+  s->set_reg(s, 0xff, 0xff, 0x00);  // bank: DSP
+  s->set_reg(s, 0x7c, 0xff, 0x00);  // SDE indirect address → control/enable
+  s->set_reg(s, 0x7d, 0xff, 0x07);  // enable: sat + sat_boost + bright/contrast
+  s->set_reg(s, 0x7c, 0xff, 0x03);  // SDE indirect address → U_SAT
+  s->set_reg(s, 0x7d, 0xff, 0x88);  // U_SAT = 0x88 = 136  (API max ≈ 0x68 = 104, ~30% boost)
+  s->set_reg(s, 0x7c, 0xff, 0x04);  // SDE indirect address → V_SAT
+  s->set_reg(s, 0x7d, 0xff, 0x88);  // V_SAT = 0x88 = 136
 }
 
 // ================= MENU DRAW =================

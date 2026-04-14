@@ -20,11 +20,18 @@ h1{font-size:1.4em;margin-bottom:12px;color:#fff}
 .bar{background:#222;border-radius:8px;overflow:hidden;height:24px;margin-bottom:12px;position:relative}
 .bar-fill{height:100%;background:linear-gradient(90deg,#2ecc71,#27ae60);transition:width .3s}
 .bar-text{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:.8em;color:#fff;white-space:nowrap}
-.tabs{display:flex;gap:8px;margin-bottom:12px}
+.tabs{display:flex;gap:8px;margin-bottom:10px}
 .tab{flex:1;padding:10px;border:none;border-radius:8px;cursor:pointer;font-size:.9em;font-weight:600;background:#222;color:#888;text-align:center;transition:all .2s}
 .tab.active{background:#2980b9;color:#fff}
 .tab .badge{display:inline-block;background:rgba(0,0,0,.3);border-radius:10px;padding:1px 7px;font-size:.75em;margin-left:4px}
-.file{display:flex;align-items:center;background:#1a1a1a;border-radius:8px;padding:10px 12px;margin-bottom:8px;border:1px solid #2a2a2a}
+.toolbar{display:flex;gap:6px;margin-bottom:10px;align-items:center;flex-wrap:wrap}
+.btn-sel{background:#555;color:#fff;transition:background .2s}
+.btn-sel.active{background:#8e44ad}
+.file{display:flex;align-items:center;background:#1a1a1a;border-radius:8px;padding:10px 12px;margin-bottom:8px;border:1px solid #2a2a2a;transition:border-color .15s}
+.file.checked{border-color:#8e44ad;background:#1a1a2a}
+.chk-wrap{width:0;overflow:hidden;transition:width .2s;display:flex;align-items:center;flex-shrink:0}
+.select-mode .chk-wrap{width:28px}
+input[type=checkbox]{width:18px;height:18px;accent-color:#8e44ad;cursor:pointer;flex-shrink:0}
 .thumb{width:80px;height:45px;border-radius:4px;object-fit:cover;flex-shrink:0;background:#222}
 .file-info{flex:1;min-width:0;margin-left:10px}
 .file-name{font-size:.9em;word-break:break-all;color:#fff}
@@ -33,6 +40,9 @@ h1{font-size:1.4em;margin-bottom:12px;color:#fff}
 .btn{border:none;padding:8px 12px;border-radius:6px;cursor:pointer;font-size:.8em;font-weight:600;text-decoration:none;text-align:center}
 .btn-dl{background:#2980b9;color:#fff}
 .btn-del{background:#c0392b;color:#fff}
+.btn-danger{background:#c0392b;color:#fff}
+.btn-purple{background:#8e44ad;color:#fff}
+.btn-grn{background:#27ae60;color:#fff}
 .btn:active{opacity:.7}
 .empty{text-align:center;color:#666;padding:40px 0}
 .err{text-align:center;color:#e74c3c;padding:30px 0;font-size:.9em}
@@ -52,32 +62,68 @@ h1{font-size:1.4em;margin-bottom:12px;color:#fff}
  <button class="tab active" id="tabPhotos" onclick="switchTab('photos')">&#128248; Photos <span class="badge" id="cntPhotos">0</span></button>
  <button class="tab" id="tabVideos" onclick="switchTab('videos')">&#127916; Videos <span class="badge" id="cntVideos">0</span></button>
 </div>
+<div class="toolbar">
+ <button class="btn btn-sel" id="btnSel" onclick="toggleSelectMode()">&#9745; Select</button>
+ <button class="btn btn-grn" id="btnBatchDl" style="display:none" onclick="batchDownload()">&#11015; Download Selected (<span id="selCountDl">0</span>)</button>
+ <button class="btn btn-purple" id="btnBatch" style="display:none" onclick="batchDelete()">&#128465; Delete Selected (<span id="selCount">0</span>)</button>
+ <button class="btn btn-grn" onclick="downloadAll()">&#11015; Download All</button>
+ <button class="btn btn-danger" onclick="confirmDeleteAll()">&#9888; Delete All</button>
+</div>
 <div id="list"><div class="empty">Loading...</div></div>
 <div class="modal-bg" id="modalBg"><div class="modal"><p id="modalMsg">Delete?</p><div class="btns"><button class="btn btn-dl" onclick="closeModal()">Cancel</button><button class="btn btn-del" id="modalDel">Delete</button></div></div></div>
 <script>
-let delTarget='',allFiles=[],curTab='photos';
+let allFiles=[],curTab='photos',selectMode=false,selectedFiles=new Set(),modalCb=null;
 function switchTab(t){
- curTab=t;
+ curTab=t;selectedFiles.clear();updateBatchBtn();
  document.getElementById('tabPhotos').className='tab'+(t==='photos'?' active':'');
  document.getElementById('tabVideos').className='tab'+(t==='videos'?' active':'');
  renderFiles();
+}
+function toggleSelectMode(){
+ selectMode=!selectMode;
+ if(!selectMode){selectedFiles.clear();updateBatchBtn();}
+ document.getElementById('btnSel').className='btn btn-sel'+(selectMode?' active':'');
+ renderFiles();
+}
+function toggleCheck(name){
+ if(selectedFiles.has(name))selectedFiles.delete(name);else selectedFiles.add(name);
+ updateBatchBtn();
+ document.querySelectorAll('.file').forEach(el=>{
+  let cb=el.querySelector('input');
+  if(cb&&cb.dataset.name===name){el.classList.toggle('checked',selectedFiles.has(name));cb.checked=selectedFiles.has(name);}
+ });
+}
+function updateBatchBtn(){
+ let n=selectedFiles.size;
+ document.getElementById('selCount').textContent=n;
+ document.getElementById('selCountDl').textContent=n;
+ document.getElementById('btnBatch').style.display=n>0?'':'none';
+ document.getElementById('btnBatchDl').style.display=n>0?'':'none';
 }
 function renderFiles(){
  let el=document.getElementById('list');
  let filtered=allFiles.filter(f=>curTab==='videos'?f.isVideo:!f.isVideo);
  filtered.sort((a,b)=>b.name.localeCompare(a.name,undefined,{numeric:true}));
  if(!filtered.length){el.innerHTML='<div class="empty">No '+(curTab==='videos'?'videos':'photos')+' on SD card</div>';return;}
- let h='';
+ let wrap=document.createElement('div');
+ wrap.className=selectMode?'select-mode':'';
  filtered.forEach(f=>{
   let sz=f.size<1048576?(f.size/1024).toFixed(1)+' KB':(f.size/1048576).toFixed(1)+' MB';
-  h+='<div class="file">';
-  h+='<img class="thumb" loading="lazy" src="/api/preview?file='+encodeURIComponent(f.name)+'" alt="">';
-  h+='<div class="file-info"><div class="file-name">'+f.name+'</div><div class="file-size">'+sz+'</div></div><div class="btns">';
-  h+='<a class="btn btn-dl" download href="/api/download?file='+encodeURIComponent(f.name)+'">&#11015;</a>';
-  h+='<button class="btn btn-del" onclick="confirmDel(\''+f.name.replace(/'/g,"\\'")+'\')">\&#128465;</button>';
-  h+='</div></div>';
+  let chk=selectedFiles.has(f.name);
+  let div=document.createElement('div');
+  div.className='file'+(chk?' checked':'');
+  let fn=f.name.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+  div.innerHTML=
+   '<div class="chk-wrap"><input type="checkbox" data-name="'+f.name+'" '+(chk?'checked':'')+' onchange="toggleCheck(\''+fn+'\')" /></div>'+
+   '<img class="thumb" loading="lazy" src="/api/preview?file='+encodeURIComponent(f.name)+'" alt="">'+
+   '<div class="file-info"><div class="file-name">'+f.name+'</div><div class="file-size">'+sz+'</div></div>'+
+   '<div class="btns">'+
+   '<a class="btn btn-dl" download href="/api/download?file='+encodeURIComponent(f.name)+'">&#11015;</a>'+
+   '<button class="btn btn-del" onclick="confirmDel(\''+fn+'\')">&#128465;</button>'+
+   '</div>';
+  wrap.appendChild(div);
  });
- el.innerHTML=h;
+ el.innerHTML='';el.appendChild(wrap);
 }
 function load(){
  fetch('/api/info').then(r=>r.json()).then(d=>{
@@ -90,26 +136,56 @@ function load(){
  fetch('/api/files').then(r=>r.json()).then(files=>{
   if(files.error){document.getElementById('list').innerHTML='<div class="err">'+files.error+'</div>';return;}
   allFiles=files;
-  let photos=files.filter(f=>!f.isVideo).length;
-  let videos=files.filter(f=>f.isVideo).length;
-  document.getElementById('cntPhotos').textContent=photos;
-  document.getElementById('cntVideos').textContent=videos;
+  document.getElementById('cntPhotos').textContent=files.filter(f=>!f.isVideo).length;
+  document.getElementById('cntVideos').textContent=files.filter(f=>f.isVideo).length;
   renderFiles();
  }).catch(()=>{document.getElementById('list').innerHTML='<div class="err">Connection error</div>';});
 }
-function confirmDel(name){delTarget=name;document.getElementById('modalMsg').textContent='Delete '+name+'?';document.getElementById('modalBg').classList.add('show');}
-function closeModal(){document.getElementById('modalBg').classList.remove('show');delTarget='';}
-document.getElementById('modalDel').onclick=function(){
- if(!delTarget)return;
+function confirmDel(name){
+ modalCb=()=>doDelete([name]);
+ document.getElementById('modalMsg').textContent='Delete '+name+'?';
+ document.getElementById('modalBg').classList.add('show');
+}
+function confirmDeleteAll(){
+ let names=allFiles.filter(f=>curTab==='videos'?f.isVideo:!f.isVideo).map(f=>f.name);
+ if(!names.length)return;
+ modalCb=()=>doDelete(names);
+ document.getElementById('modalMsg').textContent='Delete all '+names.length+' '+(curTab==='videos'?'videos':'photos')+'?';
+ document.getElementById('modalBg').classList.add('show');
+}
+function batchDelete(){
+ let names=[...selectedFiles];if(!names.length)return;
+ modalCb=()=>doDelete(names);
+ document.getElementById('modalMsg').textContent='Delete '+names.length+' selected file'+(names.length>1?'s':'')+'?';
+ document.getElementById('modalBg').classList.add('show');
+}
+function closeModal(){document.getElementById('modalBg').classList.remove('show');}
+document.getElementById('modalDel').onclick=function(){let cb=modalCb;modalCb=null;closeModal();if(cb)cb();};
+async function doDelete(names){
  let s=document.getElementById('status');
- s.textContent='Deleting...';s.style.color='#e67e22';
- fetch('/api/delete?file='+encodeURIComponent(delTarget),{method:'DELETE'}).then(r=>r.json()).then(d=>{
-  closeModal();
-  s.textContent=d.ok?'Deleted!':'Error: '+d.msg;
-  s.style.color=d.ok?'#2ecc71':'#c0392b';
-  setTimeout(()=>{s.textContent='';load();},1200);
- });
-};
+ let ok=0,fail=0;
+ for(let i=0;i<names.length;i++){
+  s.textContent='Deleting '+(i+1)+'/'+names.length+'...';s.style.color='#e67e22';
+  try{let r=await fetch('/api/delete?file='+encodeURIComponent(names[i]),{method:'DELETE'});let d=await r.json();if(d.ok)ok++;else fail++;}catch(e){fail++;}
+ }
+ selectedFiles.clear();selectMode=false;
+ document.getElementById('btnSel').className='btn btn-sel';updateBatchBtn();
+ s.textContent=fail===0?'Deleted '+ok+' file'+(ok>1?'s':'')+'!':ok+' deleted, '+fail+' failed';
+ s.style.color=fail===0?'#2ecc71':'#e74c3c';
+ setTimeout(()=>{s.textContent='';load();},1500);
+}
+async function doDownload(names){
+ let s=document.getElementById('status');
+ for(let i=0;i<names.length;i++){
+  s.textContent='Downloading '+(i+1)+'/'+names.length+'...';s.style.color='#2980b9';
+  let a=document.createElement('a');a.href='/api/download?file='+encodeURIComponent(names[i]);a.download='';document.body.appendChild(a);a.click();document.body.removeChild(a);
+  if(i<names.length-1) await new Promise(r=>setTimeout(r,800));
+ }
+ s.textContent='Started '+names.length+' download'+(names.length>1?'s':'')+'!';s.style.color='#2ecc71';
+ setTimeout(()=>{s.textContent='';},2000);
+}
+function batchDownload(){let names=[...selectedFiles];if(names.length)doDownload(names);}
+function downloadAll(){let names=allFiles.filter(f=>curTab==='videos'?f.isVideo:!f.isVideo).map(f=>f.name);if(names.length)doDownload(names);}
 load();
 </script>
 </body>

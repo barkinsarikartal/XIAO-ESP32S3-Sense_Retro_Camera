@@ -14,7 +14,7 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **Timelapse Mode** — Periodic HD photo capture at configurable intervals (5s–10min); TFT shows countdown, photo count, elapsed time; pause/resume/stop via encoder
 - **Recording Duration Limit** — Configurable auto-stop for video recording (30s–15min or unlimited)
 - **FPS Counter & SD Status** — Live overlay showing frame rate and SD card health
-- **WiFi File Server** — AP mode with a tabbed HTML file manager (Photos / Videos tabs with file count badges, sorted newest-first); download with browser progress bar, preview, or delete assets wirelessly with video thumbnail support
+- **WiFi File Server** — AP mode with a tabbed HTML file manager (Photos / Videos tabs with file count badges, sorted newest-first); download with browser progress bar, preview, delete individual files, **bulk-select and delete multiple files**, or **delete all** photos/videos in one tap; video thumbnail support
 - **On-Device Gallery** — Browse photos and videos on the TFT; video items show a thumbnail preview (frame ~1.2 s into the clip) with a play button, filename, and size overlaid on dark strips
 - **Silent Video Playback** — Plays AVI recordings on the TFT by parsing MOVI JPEG chunks; frame timing derived from the AVI header's `microSecPerFrame` for accurate real-time speed; pause/resume/stop via encoder
 - **File Deletion** — Delete photos and videos directly from the device with a confirmation dialog
@@ -121,6 +121,8 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - Navigate to `http://192.168.4.1` — tabbed interface: **Photos** and **Videos** tabs, each sorted **newest-first** with file count badges
 - Both photos and videos display thumbnail previews; video thumbnails are extracted from frame ~1.2 s into the clip
 - Downloads include a `Content-Length` header so the browser shows a progress bar with percentage
+- **Bulk delete:** tap **☑ Select** to enter selection mode, check individual files, then **Delete Selected (N)** — a single confirmation before deleting
+- **Delete all:** tap **⚠ Delete All** to remove every file in the current tab (Photos or Videos) with one confirmation
 - Press the encoder click/long to exit WiFi mode and resume camera
 
 ### SD Card Status
@@ -242,6 +244,7 @@ Components are soldered on perfboard, powered by a 3.7 V 18650 Li-ion cell.
 | Inverted colours on TFT | Toggle `pcfg.invert` in `initCamera()` |
 | SD not detected | FAT32 format; < 32 GB recommended; check GPIO 21 CS |
 | AVI won't play | Use VLC; some players don't support MJPEG in AVI |
+| Green / overexposed viewfinder after long use | A camera watchdog reinits the OV2640 every 30 s in IDLE mode to prevent AEC/AGC gain drift; if it occurs before the watchdog fires, press the encoder to enter and exit the menu (this triggers a camera reinit) |
 
 ---
 

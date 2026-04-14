@@ -949,6 +949,10 @@ static void IRAM_ATTR encSwISR() {
 static void taskCapture(void *pvParameters) {
   int fail_count = 0;
 
+  // Camera watchdog timer — persists across iterations (local static)
+  // Tracks time since last reinit; reset to 0 whenever we leave IDLE.
+  static unsigned long camWdgLastReset = 0;
+
   while (true) {
     // Skip capture when camera is deinited (WiFi mode, gallery states)
     {
@@ -957,9 +961,30 @@ static void taskCapture(void *pvParameters) {
           cs == STATE_GALLERY_TYPE || cs == STATE_GALLERY_PHOTOS ||
           cs == STATE_GALLERY_VIDEOS || cs == STATE_DELETE_CONFIRM ||
           cs == STATE_VIDEO_PLAYING || cs == STATE_TIMELAPSE) {
+        camWdgLastReset = 0;  // not in IDLE — reset timer when we return
         vTaskDelay(pdMS_TO_TICKS(100));
         continue;
       }
+    }
+
+    // ── Camera watchdog: periodic soft-reset to prevent AEC/AGC drift ──
+    // After long operation in low-light, the OV2640 gain algorithm can drift,
+    // causing a greenish/overexposed viewfinder. A silent reinit every 30 s
+    // in IDLE mode keeps the sensor anchored without any user-visible impact.
+    // Not applied during recording, photo capture, timelapse, or menu states.
+    if (appState == STATE_IDLE) {
+      unsigned long now = millis();
+      if (camWdgLastReset == 0) {
+        camWdgLastReset = now;                            // arm timer on first IDLE frame
+      } else if (now - camWdgLastReset >= 30000UL) {
+        Serial.println("[CAM] Watchdog: soft-reset to prevent AEC/AGC drift");
+        camWdgLastReset = now;
+        initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue;                                         // skip this frame's fb_get
+      }
+    } else {
+      camWdgLastReset = 0;  // recording/photo/stopping — re-arm after returning to IDLE
     }
 
     // ---- Handle state transition events ----
@@ -1456,7 +1481,7 @@ void initCamera(pixformat_t format, framesize_t size, int jpeg_quality) {
     if (format == PIXFORMAT_JPEG)
       s->set_gainceiling(s, GAINCEILING_16X);
     else
-      s->set_gainceiling(s, GAINCEILING_4X);
+      s->set_gainceiling(s, GAINCEILING_2X);  // IDLE/RGB565: conservative gain reduces green-drift risk
   }
   delay(100);
 }
