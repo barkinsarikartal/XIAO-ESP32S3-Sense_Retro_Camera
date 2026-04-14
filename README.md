@@ -10,11 +10,11 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **Video Recording with Audio** — MJPEG video at 480×320, 10 FPS, with 16 kHz mono PCM audio via the built-in PDM microphone, saved as `.avi`
 - **Live Viewfinder** — Real-time 320×240 RGB565 camera preview on the TFT display
 - **Main Menu** — Encoder-driven main menu with Gallery, WiFi Transfer, Camera Settings, Timelapse, and Exit options
-- **Camera Settings** — On-device configuration of 11 parameters (brightness, contrast, saturation, AE level, white balance, special effects, mirror, flip, JPEG quality, timelapse interval, recording duration limit) with NVS persistence
+- **Camera Settings** — On-device configuration of 12 parameters (brightness, contrast, saturation, AE level, white balance, special effects, mirror, flip, JPEG quality, timelapse interval, recording duration limit, file counter reset) with NVS persistence
 - **Timelapse Mode** — Periodic HD photo capture at configurable intervals (5s–10min); TFT shows countdown, photo count, elapsed time; pause/resume/stop via encoder
 - **Recording Duration Limit** — Configurable auto-stop for video recording (30s–15min or unlimited)
 - **FPS Counter & SD Status** — Live overlay showing frame rate and SD card health
-- **WiFi File Server** — AP mode with a tabbed HTML file manager (Photos / Videos tabs with file count badges, alphabetically sorted); download, preview, or delete assets wirelessly with video thumbnail support
+- **WiFi File Server** — AP mode with a tabbed HTML file manager (Photos / Videos tabs with file count badges, sorted newest-first); download with browser progress bar, preview, or delete assets wirelessly with video thumbnail support
 - **On-Device Gallery** — Browse photos and videos on the TFT; video items show a thumbnail preview (frame ~1.2 s into the clip) with a play button, filename, and size overlaid on dark strips
 - **Silent Video Playback** — Plays AVI recordings on the TFT by parsing MOVI JPEG chunks; frame timing derived from the AVI header's `microSecPerFrame` for accurate real-time speed; pause/resume/stop via encoder
 - **File Deletion** — Delete photos and videos directly from the device with a confirmation dialog
@@ -118,8 +118,9 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 ### WiFi File Manager
 - Select **WiFi Transfer** from the main menu (requires SD card)
 - Connect your phone/PC to `Retro_Cam` (password: `barkinsarikartal`)
-- Navigate to `http://192.168.4.1` — tabbed interface: **Photos** and **Videos** tabs, each sorted alphabetically with file count badges
+- Navigate to `http://192.168.4.1` — tabbed interface: **Photos** and **Videos** tabs, each sorted **newest-first** with file count badges
 - Both photos and videos display thumbnail previews; video thumbnails are extracted from frame ~1.2 s into the clip
+- Downloads include a `Content-Length` header so the browser shows a progress bar with percentage
 - Press the encoder click/long to exit WiFi mode and resume camera
 
 ### SD Card Status
@@ -144,13 +145,14 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 
 ### Camera Settings
 - Select "Settings" from the main menu
-- **CW / CCW** to browse the 9 parameters (scrollable list)
+- **CW / CCW** to browse the 12 parameters (scrollable list)
 - **Click** to enter edit mode (highlighted row turns yellow)
 - **CW / CCW** to adjust the value within its valid range
 - **Click** to confirm and save to NVS
 - **Long press** in edit mode cancels the change
 - **Long press** in browse mode returns to the main menu
-- Available settings: Brightness, Contrast, Saturation, AE Level, White Balance, Special Effect, Mirror, Flip, JPEG Quality, Timelapse Interval, Recording Limit
+- Available settings: Brightness, Contrast, Saturation, AE Level, White Balance, Special Effect, Mirror, Flip, JPEG Quality, Timelapse Interval, Recording Limit, Reset Counters
+- **Reset Counters (Rst Cnt):** Resets the photo and video file counters in NVS to 0. Uses a two-step confirm (No / YES) to prevent accidental resets. After confirming, a warning screen reminds you to back up your files via WiFi and delete them from the SD card before capturing new ones (the camera will skip over existing filenames automatically, but gallery display will be out of order until the SD is clean)
 
 ### Timelapse Mode
 - Select "Timelapse" from the main menu (requires SD card)
@@ -250,8 +252,8 @@ Components are soldered on perfboard, powered by a 3.7 V 18650 Li-ion cell.
 | Viewfinder FPS | 15–25 FPS |
 | Photo save time | 3–5 seconds |
 | Video recording FPS | 9–10 FPS |
-| RAM usage | ~18% of 320 KB |
-| Flash usage | ~38% of 3.3 MB |
+| RAM usage | ~17.9% of 320 KB |
+| Flash usage | ~37.8% of 3.3 MB |
 
 ---
 
