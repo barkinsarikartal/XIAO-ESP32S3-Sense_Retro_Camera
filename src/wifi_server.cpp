@@ -103,7 +103,7 @@ document.getElementById('modalDel').onclick=function(){
  if(!delTarget)return;
  let s=document.getElementById('status');
  s.textContent='Deleting...';s.style.color='#e67e22';
- fetch('/api/delete?file='+encodeURIComponent(delTarget)).then(r=>r.json()).then(d=>{
+ fetch('/api/delete?file='+encodeURIComponent(delTarget),{method:'DELETE'}).then(r=>r.json()).then(d=>{
   closeModal();
   s.textContent=d.ok?'Deleted!':'Error: '+d.msg;
   s.style.color=d.ok?'#2ecc71':'#c0392b';
@@ -228,7 +228,12 @@ void startWiFiMode() {
       return;
     }
 
-    String contentType = filename.endsWith(".jpg") ? "image/jpeg" : "application/octet-stream";
+    String contentType = filename.endsWith(".jpg") ? "image/jpeg" : "video/avi";
+
+    // Extract just the basename for the Content-Disposition header
+    String basename = filename;
+    int slash = basename.lastIndexOf('/');
+    if (slash >= 0) basename = basename.substring(slash + 1);
 
     AsyncWebServerResponse *response = request->beginChunkedResponse(
       contentType.c_str(),
@@ -245,6 +250,8 @@ void startWiFiMode() {
         return bytesRead;
       }
     );
+    // Force browser to save with the original filename (e.g. vid_1.avi, hd_pic_2.jpg)
+    response->addHeader("Content-Disposition", "attachment; filename=\"" + basename + "\"");
     request->send(response);
   });
 
@@ -339,7 +346,7 @@ void startWiFiMode() {
   });
 
   // Route: delete file — validates SD mount
-  webServer->on("/api/delete", HTTP_GET, [](AsyncWebServerRequest *request) {
+  webServer->on("/api/delete", HTTP_DELETE, [](AsyncWebServerRequest *request) {
     if (!request->hasParam("file")) {
       request->send(400, "application/json", "{\"ok\":false,\"msg\":\"Missing file param\"}");
       return;

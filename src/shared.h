@@ -75,7 +75,7 @@
 #define IDLE_JPEG_QUALITY 0
 
 // ================= FIRMWARE VERSION =================
-#define FIRMWARE_VERSION "v1.0"
+#define FIRMWARE_VERSION "v1.1"
 
 // ================= WIFI AP CONFIG =================
 #define WIFI_SSID "Retro_Cam"
@@ -84,6 +84,8 @@
 // ================= DEBUG FLAGS =================
 // Set to 1 to enable Serial.printf for every InputEvent sent.
 #define DEBUG_INPUT 0
+// Set to 1 to add 8s boot delay for Serial Monitor attachment.
+#define DEBUG_BOOT_DELAY 0
 
 // ================= AUDIO SETTINGS =================
 #define AUDIO_SAMPLE_RATE       16000
@@ -115,8 +117,8 @@
 #define GALLERY_NAME_LEN   24
 
 // ================= MENU =================
-#define MENU_MAIN_ITEMS 4
-#define SETTINGS_COUNT  9
+#define MENU_MAIN_ITEMS 5
+#define SETTINGS_COUNT  11
 
 // ================= APP STATE & EVENTS =================
 enum AppState {
@@ -132,6 +134,7 @@ enum AppState {
   STATE_DELETE_CONFIRM,
   STATE_WIFI_MODE,
   STATE_SETTINGS,
+  STATE_TIMELAPSE,
 };
 
 #define EVT_START_RECORDING  (1 << 0)
@@ -161,15 +164,17 @@ struct SDStatus {
 };
 
 struct CameraSettings {
-  int brightness;     // -2..+2   (default: 1)
-  int contrast;       // -2..+2   (default: 0)
-  int saturation;     // -2..+2   (default: 2)
-  int ae_level;       // -2..+2   (default: 0)
-  int wb_mode;        // 0=Auto 1=Sunny 2=Cloudy 3=Office 4=Home
-  int special_effect; // 0=None 1=Neg 2=Gray 3=Red 4=Green 5=Blue 6=Sepia
-  int hmirror;        // 0/1      (default: 1)
-  int vflip;          // 0/1      (default: 0)
-  int jpeg_quality;   // 4=Max..63=Low, inverse scale (default: 12)
+  int brightness;          // -2..+2   (default: 1)
+  int contrast;            // -2..+2   (default: 0)
+  int saturation;          // -2..+2   (default: 2)
+  int ae_level;            // -2..+2   (default: 0)
+  int wb_mode;             // 0=Auto 1=Sunny 2=Cloudy 3=Office 4=Home
+  int special_effect;      // 0=None 1=Neg 2=Gray 3=Red 4=Green 5=Blue 6=Sepia
+  int hmirror;             // 0/1      (default: 1)
+  int vflip;               // 0/1      (default: 0)
+  int jpeg_quality;        // 4=Max..63=Low, inverse scale (default: 12)
+  int timelapse_interval;  // seconds between captures (default: 10)
+  int rec_max_seconds;     // 0=unlimited, >0=auto-stop after N seconds (default: 0)
 };
 
 typedef struct { int idx; size_t len; } RecFrame;

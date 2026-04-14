@@ -13,6 +13,8 @@ void loadCameraSettings() {
   camSettings.hmirror       = p.getInt("hmirr",  1);
   camSettings.vflip         = p.getInt("vflip",  0);
   camSettings.jpeg_quality  = p.getInt("jpgq",  12);
+  camSettings.timelapse_interval = p.getInt("tlint", 10);
+  camSettings.rec_max_seconds    = p.getInt("reclim", 0);
   p.end();
   Serial.println("[NVS] Camera settings loaded.");
 }
@@ -29,6 +31,8 @@ void saveCameraSettings() {
   p.putInt("hmirr",  camSettings.hmirror);
   p.putInt("vflip",  camSettings.vflip);
   p.putInt("jpgq",   camSettings.jpeg_quality);
+  p.putInt("tlint",  camSettings.timelapse_interval);
+  p.putInt("reclim", camSettings.rec_max_seconds);
   p.end();
   Serial.println("[NVS] Camera settings saved.");
 }
@@ -52,11 +56,11 @@ void applySettings(sensor_t *s) {
 // Draw the main menu (Gallery / WiFi / Settings / Exit).
 void drawMenuMain() {
   static const char* const labels[MENU_MAIN_ITEMS] = {
-    "Gallery", "WiFi Transfer", "Settings", "Exit"
+    "Gallery", "WiFi Transfer", "Settings", "Timelapse", "Exit"
   };
   // Accent colours per item for visual variety
   static const uint16_t accents[MENU_MAIN_ITEMS] = {
-    TFT_CYAN, TFT_YELLOW, TFT_ORANGE, 0x7BEF  // cyan, yellow, orange, grey
+    TFT_CYAN, TFT_YELLOW, TFT_ORANGE, TFT_GREEN, 0x7BEF  // cyan, yellow, orange, green, grey
   };
 
   if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
@@ -66,23 +70,23 @@ void drawMenuMain() {
     // Title
     tft.setTextSize(2);
     tft.setTextColor(TFT_WHITE);
-    tft.drawString("MENU", tft.width() / 2, 22);
+    tft.drawString("MENU", tft.width() / 2, 18);
 
-    // Menu items
-    int yStart = 55;
-    int itemH = 38;
+    // Menu items — tighter spacing for 5 items
+    int yStart = 45;
+    int itemH = 35;
     for (int i = 0; i < MENU_MAIN_ITEMS; i++) {
       int y = yStart + i * itemH;
       if (i == menuMainSelection) {
-        tft.fillRoundRect(50, y, 220, 32, 8, accents[i]);
+        tft.fillRoundRect(50, y, 220, 30, 8, accents[i]);
         tft.setTextSize(2);
         tft.setTextColor(TFT_BLACK);
       } else {
-        tft.drawRoundRect(50, y, 220, 32, 8, 0x4208);
+        tft.drawRoundRect(50, y, 220, 30, 8, 0x4208);
         tft.setTextSize(2);
         tft.setTextColor(0x7BEF);
       }
-      tft.drawString(labels[i], tft.width() / 2, y + 16);
+      tft.drawString(labels[i], tft.width() / 2, y + 15);
     }
 
     // Footer hint
@@ -103,7 +107,8 @@ void drawSettingsMenu() {
   // Human-readable labels matching CameraSettings struct field order
   static const char* const names[SETTINGS_COUNT] = {
     "Bright", "Contr", "Satur", "AE Lv",
-    "WB", "FX", "Mirror", "Flip", "JPEG Q"
+    "WB", "FX", "Mirror", "Flip", "JPEG Q",
+    "TL Int", "Rec Lim"
   };
   // White balance mode labels
   static const char* const wbLabels[] = {
@@ -118,7 +123,8 @@ void drawSettingsMenu() {
   int vals[SETTINGS_COUNT] = {
     camSettings.brightness, camSettings.contrast, camSettings.saturation,
     camSettings.ae_level, camSettings.wb_mode, camSettings.special_effect,
-    camSettings.hmirror, camSettings.vflip, camSettings.jpeg_quality
+    camSettings.hmirror, camSettings.vflip, camSettings.jpeg_quality,
+    camSettings.timelapse_interval, camSettings.rec_max_seconds
   };
 
   if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
@@ -172,6 +178,15 @@ void drawSettingsMenu() {
       } else if (i == 6 || i == 7) {
         // Boolean — show On/Off
         snprintf(valBuf, sizeof(valBuf), "%s", vals[i] ? "On" : "Off");
+      } else if (i == 9 || i == 10) {
+        // Time-based — format seconds to human-readable
+        if (i == 10 && vals[i] == 0) {
+          snprintf(valBuf, sizeof(valBuf), "Off");
+        } else if (vals[i] < 60) {
+          snprintf(valBuf, sizeof(valBuf), "%ds", vals[i]);
+        } else {
+          snprintf(valBuf, sizeof(valBuf), "%dm", vals[i] / 60);
+        }
       } else {
         snprintf(valBuf, sizeof(valBuf), "%d", vals[i]);
       }

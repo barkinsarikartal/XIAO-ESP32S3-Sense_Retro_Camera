@@ -106,10 +106,7 @@ void endAVI(File &file, int fps, int width, int height) {
   Serial.printf("[REC] Actual FPS: %.2f, frames: %d, audio chunks: %d\n",
                 real_fps, avi_total_frames, avi_total_audio_chunks);
 
-  // Use the declared TARGET_FPS for the AVI header rather than the measured average.
-  // The measured average is skewed by the camera warm-up period and variable SD
-  // write latency; a stable constant gives AVI players a reliable timing baseline.
-  uint32_t microSecPerFrame = 1000000UL / TARGET_FPS;
+
 
   // Each audio chunk is exactly AUDIO_BYTES_PER_FRAME bytes (zero-padded when
   // needed), so total samples is exactly chunks × samples-per-chunk.

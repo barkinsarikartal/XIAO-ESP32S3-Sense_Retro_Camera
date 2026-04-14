@@ -1,6 +1,6 @@
 # XIAO ESP32-S3 Sense Retro Camera
 
-A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Sense. Captures high-resolution photos and MJPEG/PCM audio video, with a live viewfinder on a 2.0" TFT display. Features a full encoder-driven menu system with on-device gallery (including video thumbnail previews), camera settings, and a tabbed wireless file manager. Modular codebase with a multi-task FreeRTOS architecture for robust, concurrent operation.
+A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Sense. Captures high-resolution photos and MJPEG/PCM audio video, with a live viewfinder on a 2.0" TFT display. Features a full encoder-driven menu system with on-device gallery (including video thumbnail previews), camera settings, timelapse mode, and a tabbed wireless file manager. Modular codebase with a multi-task FreeRTOS architecture for robust, concurrent operation.
 
 ---
 
@@ -9,8 +9,10 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **High-Resolution Photo Capture** — HD JPEG images (1280×720) saved to SD card
 - **Video Recording with Audio** — MJPEG video at 480×320, 10 FPS, with 16 kHz mono PCM audio via the built-in PDM microphone, saved as `.avi`
 - **Live Viewfinder** — Real-time 320×240 RGB565 camera preview on the TFT display
-- **Main Menu** — Encoder-driven main menu with Gallery, WiFi Transfer, Camera Settings, and Exit options
-- **Camera Settings** — On-device configuration of 9 sensor parameters (brightness, contrast, saturation, AE level, white balance, special effects, mirror, flip, JPEG quality) with NVS persistence
+- **Main Menu** — Encoder-driven main menu with Gallery, WiFi Transfer, Camera Settings, Timelapse, and Exit options
+- **Camera Settings** — On-device configuration of 11 parameters (brightness, contrast, saturation, AE level, white balance, special effects, mirror, flip, JPEG quality, timelapse interval, recording duration limit) with NVS persistence
+- **Timelapse Mode** — Periodic HD photo capture at configurable intervals (5s–10min); TFT shows countdown, photo count, elapsed time; pause/resume/stop via encoder
+- **Recording Duration Limit** — Configurable auto-stop for video recording (30s–15min or unlimited)
 - **FPS Counter & SD Status** — Live overlay showing frame rate and SD card health
 - **WiFi File Server** — AP mode with a tabbed HTML file manager (Photos / Videos tabs with file count badges, alphabetically sorted); download, preview, or delete assets wirelessly with video thumbnail support
 - **On-Device Gallery** — Browse photos and videos on the TFT; video items show a thumbnail preview (frame ~1.2 s into the clip) with a play button, filename, and size overlaid on dark strips
@@ -129,7 +131,7 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **Encoder click** from Idle → Main Menu
 - **Turn** (CW / CCW) to highlight an option, **click** to select
 - **Long press** at any level = go back (universal)
-- Menu items: **Gallery**, **WiFi Transfer**, **Settings**, **Exit**
+- Menu items: **Gallery**, **WiFi Transfer**, **Settings**, **Timelapse**, **Exit**
 
 ### Gallery (Photos & Videos)
 - Select "Gallery" from the main menu → Gallery type selector (Photos / Videos)
@@ -148,7 +150,14 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **Click** to confirm and save to NVS
 - **Long press** in edit mode cancels the change
 - **Long press** in browse mode returns to the main menu
-- Available settings: Brightness, Contrast, Saturation, AE Level, White Balance, Special Effect, Mirror, Flip, JPEG Quality
+- Available settings: Brightness, Contrast, Saturation, AE Level, White Balance, Special Effect, Mirror, Flip, JPEG Quality, Timelapse Interval, Recording Limit
+
+### Timelapse Mode
+- Select "Timelapse" from the main menu (requires SD card)
+- Camera switches to HD mode; captures photos at the configured interval
+- TFT shows countdown to next capture, photo count, and elapsed time
+- **Click** the encoder to pause/resume
+- **Long press** the encoder or **press shutter** to stop → returns to idle
 
 ---
 ### Source Code Structure

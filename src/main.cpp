@@ -25,7 +25,7 @@ volatile AppState appState = STATE_IDLE;
 EventGroupHandle_t appEvents;
 QueueHandle_t inputEventQueue = NULL;
 SDStatus globalSDState = {false, false, "NO CARD"};
-CameraSettings camSettings = { 1, 0, 2, 0, 0, 0, 1, 0, 12 };
+CameraSettings camSettings = { 1, 0, 2, 0, 0, 0, 1, 0, 12, 10, 0 };
 camera_config_t config;
 int pictureNumber = 0;
 int videoNumber = 0;
@@ -63,10 +63,11 @@ int menuMainSelection = 0;
 int settingsIndex = 0;
 bool settingsEditing = false;
 
-// Encoder ISR state
-volatile uint8_t encPrevState = 3;   // both HIGH at boot (INPUT_PULLUP default)
-volatile int8_t  encAccum     = 0;   // direction accumulator between detents
-volatile uint32_t encSwPressMs = 0;  // timestamp of SW button press edge
+// Encoder ISR state — DRAM_ATTR keeps these in internal SRAM so ISRs
+// can access them safely even during flash cache misses (e.g. SD writes).
+DRAM_ATTR volatile uint8_t encPrevState = 3;   // both HIGH at boot (INPUT_PULLUP default)
+DRAM_ATTR volatile int8_t  encAccum     = 0;   // direction accumulator between detents
+DRAM_ATTR volatile uint32_t encSwPressMs = 0;  // timestamp of SW button press edge
 
 // Debug counters: ISR increments, taskInput reads and prints the delta.
 // Safe because uint32 reads/writes are atomic on Xtensa; no mutex needed.
@@ -87,11 +88,16 @@ static void savePhotoHighRes();
 static void drawStatusBar(float fps);
 static void encoderISR();
 static void encSwISR();
+static void runTimelapse();
 
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  delay(8000);
+#if DEBUG_BOOT_DELAY
+  delay(8000);  // Long delay for Serial Monitor attachment during debugging
+#else
+  delay(1000);
+#endif
 
   WiFi.mode(WIFI_OFF);
   esp_bt_controller_disable();
@@ -423,6 +429,10 @@ static void taskInput(void *pvParameters) {
           // Stop recording
           xEventGroupSetBits(appEvents, EVT_STOP_RECORDING);
           sendEvent(INPUT_BTN_SHORT);
+        } else if (appState == STATE_TIMELAPSE) {
+          // Safe exit: use intermediate state so runTimelapse() handles camera cleanup.
+          // Don't call emergencyExitToIdle() — it would race with camera ops in runTimelapse.
+          appState = STATE_MENU_MAIN;
         } else if (appState == STATE_MENU_MAIN || appState == STATE_SETTINGS ||
                    appState == STATE_GALLERY_TYPE || appState == STATE_GALLERY_PHOTOS ||
                    appState == STATE_GALLERY_VIDEOS || appState == STATE_DELETE_CONFIRM ||
@@ -431,7 +441,11 @@ static void taskInput(void *pvParameters) {
           emergencyExitToIdle();
         }
       }
-      // Long press released — already handled below via held detection
+      // Long press released: timelapse needs explicit handling (not in held isMenu list)
+      else if (appState == STATE_TIMELAPSE) {
+        appState = STATE_MENU_MAIN;
+      }
+      // Other long presses handled by held detection below
     }
 
     // ── SHUTTER held long (>1s) -> start recording ──
@@ -475,8 +489,8 @@ static void taskInput(void *pvParameters) {
 
     // ── Process encoder events from ISR queue ──
     // Unified consumer: all encoder-based state transitions handled here.
-    // Skipped during video playback — playVideoOnTFT() consumes events directly.
-    if (appState != STATE_VIDEO_PLAYING) {
+    // Skipped during video playback and timelapse — those modes consume events directly.
+    if (appState != STATE_VIDEO_PLAYING && appState != STATE_TIMELAPSE) {
       InputEvent ev;
       while (xQueueReceive(inputEventQueue, &ev, 0) == pdTRUE) {
         if (ev.type != INPUT_ENC_CW && ev.type != INPUT_ENC_CCW &&
@@ -532,7 +546,18 @@ static void taskInput(void *pvParameters) {
                   appState = STATE_SETTINGS;
                   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                   break;
-                case 3: // Exit
+                case 3: // Timelapse — requires SD
+                  if (!globalSDState.isMounted) {
+                    showTFTMessage("SD REQUIRED!", TFT_RED, 1500);
+                    galleryNeedsRedraw = true;
+                    if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                    break;
+                  }
+                  appState = STATE_TIMELAPSE;
+                  galleryNeedsRedraw = true;
+                  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                  break;
+                case 4: // Exit
                   exitMenuToIdle();
                   break;
               }
@@ -728,14 +753,31 @@ static void taskInput(void *pvParameters) {
                 case 6: val = &camSettings.hmirror;       lo = 0;  hi = 1; break;
                 case 7: val = &camSettings.vflip;         lo = 0;  hi = 1; break;
                 case 8: val = &camSettings.jpeg_quality;  lo = 4;  hi = 63; break;
+                case 9: val = &camSettings.timelapse_interval; break;
+                case 10: val = &camSettings.rec_max_seconds;  break;
               }
               if (val) {
-                if (ev.type == INPUT_ENC_CW) {
-                  if (*val < hi) (*val)++;
-                  galleryNeedsRedraw = true;
-                  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
-                } else if (ev.type == INPUT_ENC_CCW) {
-                  if (*val > lo) (*val)--;
+                if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
+                  bool cw = (ev.type == INPUT_ENC_CW);
+                  if (settingsIndex == 9) {
+                    // Timelapse interval: step through presets
+                    static const int p[] = {5,10,15,30,60,120,300,600};
+                    int n = 8, ci = 0;
+                    for (int i = 0; i < n; i++) { if (p[i] >= *val) { ci = i; break; } if (i == n-1) ci = n-1; }
+                    if (cw && ci < n-1) *val = p[ci+1];
+                    else if (!cw && ci > 0) *val = p[ci-1];
+                  } else if (settingsIndex == 10) {
+                    // Rec duration limit: step through presets
+                    static const int p[] = {0,30,60,120,300,600,900};
+                    int n = 7, ci = 0;
+                    for (int i = 0; i < n; i++) { if (p[i] >= *val) { ci = i; break; } if (i == n-1) ci = n-1; }
+                    if (cw && ci < n-1) *val = p[ci+1];
+                    else if (!cw && ci > 0) *val = p[ci-1];
+                  } else {
+                    // Linear range settings
+                    if (cw) { if (*val < hi) (*val)++; }
+                    else { if (*val > lo) (*val)--; }
+                  }
                   galleryNeedsRedraw = true;
                   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                 } else if (ev.type == INPUT_ENC_CLICK) {
@@ -851,7 +893,7 @@ static void taskCapture(void *pvParameters) {
       if (cs == STATE_WIFI_MODE || cs == STATE_MENU_MAIN || cs == STATE_SETTINGS ||
           cs == STATE_GALLERY_TYPE || cs == STATE_GALLERY_PHOTOS ||
           cs == STATE_GALLERY_VIDEOS || cs == STATE_DELETE_CONFIRM ||
-          cs == STATE_VIDEO_PLAYING) {
+          cs == STATE_VIDEO_PLAYING || cs == STATE_TIMELAPSE) {
         vTaskDelay(pdMS_TO_TICKS(100));
         continue;
       }
@@ -876,6 +918,11 @@ static void taskCapture(void *pvParameters) {
       bool started = false;
       if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
         String path = "/vid_" + String(videoNumber) + ".avi";
+        // Skip past any existing files (prevents overwrite on NVS counter reset)
+        while (SD.exists(path.c_str())) {
+          videoNumber++;
+          path = "/vid_" + String(videoNumber) + ".avi";
+        }
         Serial.printf("Video Start: %s\n", path.c_str());
         videoFile = SD.open(path.c_str(), FILE_WRITE);
         if (videoFile) {
@@ -1016,6 +1063,15 @@ static void taskCapture(void *pvParameters) {
     // Return camera buffer immediately — this is the key to preventing FB-OVF
     esp_camera_fb_return(fb);
 
+    // Auto-stop recording if duration limit is configured and exceeded
+    if (appState == STATE_RECORDING && camSettings.rec_max_seconds > 0) {
+      unsigned long elapsedSec = (millis() - recordingStartTime) / 1000;
+      if (elapsedSec >= (unsigned long)camSettings.rec_max_seconds) {
+        Serial.printf("[REC] Duration limit reached (%ds), auto-stopping.\n", camSettings.rec_max_seconds);
+        xEventGroupSetBits(appEvents, EVT_STOP_RECORDING);
+      }
+    }
+
     vTaskDelay(1);
   }
 }
@@ -1062,6 +1118,12 @@ static void taskDisplay(void *pvParameters) {
       continue;
     }
 
+    // Timelapse — blocking capture loop until stopped
+    if (appState == STATE_TIMELAPSE) {
+      runTimelapse();
+      continue;
+    }
+
     int rs = dispReadSlot.load();
     if (rs < 0 || !dispBuf[rs]) {
       vTaskDelay(10);
@@ -1083,7 +1145,7 @@ static void taskDisplay(void *pvParameters) {
         // recording duration
         unsigned long elapsed = (millis() - recordingStartTime) / 1000;
         char timeStr[12];
-        sprintf(timeStr, "%02d:%02d:%02d", (int)(elapsed / 3600), (int)((elapsed % 3600) / 60), (int)(elapsed % 60));
+        snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", (int)(elapsed / 3600), (int)((elapsed % 3600) / 60), (int)(elapsed % 60));
         tft.setTextSize(2);
         tft.setTextColor(TFT_WHITE, TFT_BLACK);
         tft.setCursor(30, 6);
@@ -1234,17 +1296,26 @@ static void savePhotoHighRes() {
     if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
       if (SD.totalBytes() > 0) {
         String path = "/hd_pic_" + String(pictureNumber) + ".jpg";
+        // Skip past any existing files (prevents overwrite on NVS counter reset)
+        while (SD.exists(path.c_str())) {
+          pictureNumber++;
+          path = "/hd_pic_" + String(pictureNumber) + ".jpg";
+        }
         Serial.printf("Saving (%u bytes): %s\n", fb->len, path.c_str());
 
         File file = SD.open(path.c_str(), FILE_WRITE);
         if (file) {
-          file.write(fb->buf, fb->len);
+          size_t written = file.write(fb->buf, fb->len);
           file.close();
-          Serial.println("SUCCESS!");
-
-          pictureNumber++;
-          { Preferences p; p.begin("cnt", false); p.putInt("pic", pictureNumber); p.end(); }
-          saved = true;
+          if (written == fb->len) {
+            Serial.println("SUCCESS!");
+            pictureNumber++;
+            { Preferences p; p.begin("cnt", false); p.putInt("pic", pictureNumber); p.end(); }
+            saved = true;
+          } else {
+            Serial.printf("[ERR] Photo write incomplete: %u/%u bytes\n", written, fb->len);
+            writeErr = true;
+          }
         }
         else {
           Serial.println("File Open Error");
@@ -1372,6 +1443,210 @@ void deinitMicrophone() {
     i2s_del_channel(i2s_rx_handle);
     i2s_rx_handle = NULL;
   }
+}
+
+// ================= TIMELAPSE MODE =================
+// Runs in taskDisplay context (Core 1). Camera is reinited for HD JPEG.
+// taskCapture is idle (STATE_TIMELAPSE is in its skip list).
+// Encoder events consumed directly from inputEventQueue (like video playback).
+// Exit via: ENC_LONG, shutter button (appState changed externally by taskInput),
+// or SD card removal.
+static void runTimelapse() {
+  int interval = camSettings.timelapse_interval;
+  if (interval < 1) interval = 10;
+
+  Serial.printf("[TL] Starting timelapse, interval=%ds\n", interval);
+
+  // Camera was deinited during menu navigation — reinit for HD photo capture
+  initCamera(PHOTO_MODE, PHOTO_RESOLUTION, camSettings.jpeg_quality);
+
+  // Warm up sensor (auto-exposure settle)
+  for (int i = 0; i < 10; i++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+
+  int captureCount = 0;
+  bool paused = false;
+  bool tlStopped = false;
+  unsigned long startTime = millis();
+  unsigned long lastCaptureTime = 0;  // 0 = capture immediately on first iteration
+  unsigned long lastDisplayUpdate = 0;
+
+  // Draw initial UI chrome (title + footer — redrawn only once)
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(middle_center);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_CYAN);
+    tft.drawString("TIMELAPSE", tft.width() / 2, 16);
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+
+  while (appState == STATE_TIMELAPSE && !tlStopped) {
+    // ── Consume encoder events ──
+    InputEvent ev;
+    while (xQueueReceive(inputEventQueue, &ev, 0) == pdTRUE) {
+      if (ev.type == INPUT_ENC_CLICK) {
+        paused = !paused;
+        // Immediate visual feedback for pause toggle
+        if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(50))) {
+          tft.fillRect(0, 50, 320, 40, TFT_BLACK);
+          tft.setTextDatum(middle_center);
+          tft.setTextSize(3);
+          if (paused) {
+            tft.setTextColor(TFT_YELLOW);
+            tft.drawString("PAUSED", tft.width() / 2, 70);
+          }
+          tft.setTextDatum(top_left);
+          xSemaphoreGive(spiMutex);
+        }
+        lastDisplayUpdate = 0; // force redraw on resume
+      } else if (ev.type == INPUT_ENC_LONG) {
+        tlStopped = true;
+      }
+    }
+    if (tlStopped) break;
+
+    // ── Paused: just wait ──
+    if (paused) {
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    unsigned long now = millis();
+    unsigned long sinceCapture = (lastCaptureTime == 0) ? (unsigned long)interval * 1000 : (now - lastCaptureTime);
+    int remaining = interval - (int)(sinceCapture / 1000);
+    if (remaining < 0) remaining = 0;
+
+    // ── Time to capture? ──
+    if (sinceCapture >= (unsigned long)interval * 1000) {
+      // Show capturing indicator
+      if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(50))) {
+        tft.fillRect(0, 50, 320, 40, TFT_BLACK);
+        tft.setTextDatum(middle_center);
+        tft.setTextSize(2);
+        tft.setTextColor(TFT_GREEN);
+        tft.drawString("CAPTURING...", tft.width() / 2, 70);
+        tft.setTextDatum(top_left);
+        xSemaphoreGive(spiMutex);
+      }
+
+      camera_fb_t *fb = esp_camera_fb_get();
+      if (fb) {
+        bool saved = false;
+        if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+          if (globalSDState.isMounted) {
+            String path = "/hd_pic_" + String(pictureNumber) + ".jpg";
+            while (SD.exists(path.c_str())) {
+              pictureNumber++;
+              path = "/hd_pic_" + String(pictureNumber) + ".jpg";
+            }
+            File file = SD.open(path.c_str(), FILE_WRITE);
+            if (file) {
+              size_t written = file.write(fb->buf, fb->len);
+              file.close();
+              if (written == fb->len) {
+                pictureNumber++;
+                { Preferences p; p.begin("cnt", false); p.putInt("pic", pictureNumber); p.end(); }
+                captureCount++;
+                saved = true;
+                Serial.printf("[TL] Saved: %s (%u bytes)\n", path.c_str(), fb->len);
+              } else {
+                Serial.printf("[TL] Write incomplete: %u/%u bytes\n", written, fb->len);
+              }
+            }
+          }
+          xSemaphoreGive(spiMutex);
+        }
+        esp_camera_fb_return(fb);
+
+        // Show save result
+        if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(50))) {
+          tft.fillRect(0, 140, 320, 20, TFT_BLACK);
+          tft.setTextDatum(middle_center);
+          tft.setTextSize(1);
+          if (saved) {
+            tft.setTextColor(TFT_GREEN);
+            char msg[32];
+            snprintf(msg, sizeof(msg), "PIC #%d saved", pictureNumber - 1);
+            tft.drawString(msg, tft.width() / 2, 150);
+          } else {
+            tft.setTextColor(TFT_RED);
+            tft.drawString("Save failed!", tft.width() / 2, 150);
+          }
+          tft.setTextDatum(top_left);
+          xSemaphoreGive(spiMutex);
+        }
+
+        // SD removed during timelapse — stop
+        if (!saved && !globalSDState.isMounted) {
+          Serial.println("[TL] SD removed, stopping.");
+          break;
+        }
+      }
+      lastCaptureTime = millis();
+    }
+
+    // ── Update display (~500ms rate) ──
+    now = millis();
+    if (now - lastDisplayUpdate >= 500) {
+      lastDisplayUpdate = now;
+      unsigned long elapsedSec = (now - startTime) / 1000;
+      // Recalculate remaining after potential capture
+      if (lastCaptureTime > 0) {
+        remaining = interval - (int)((now - lastCaptureTime) / 1000);
+        if (remaining < 0) remaining = 0;
+      }
+
+      if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(50))) {
+        // Countdown
+        tft.fillRect(0, 50, 320, 40, TFT_BLACK);
+        tft.setTextDatum(middle_center);
+        tft.setTextSize(3);
+        tft.setTextColor(TFT_GREEN);
+        char countBuf[8];
+        snprintf(countBuf, sizeof(countBuf), "%d", remaining);
+        tft.drawString(countBuf, tft.width() / 2, 70);
+
+        // Info line 1: photo count + interval
+        tft.fillRect(0, 100, 320, 35, TFT_BLACK);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_WHITE);
+        char infoBuf[40];
+        snprintf(infoBuf, sizeof(infoBuf), "Photos: %d   Interval: %ds", captureCount, interval);
+        tft.drawString(infoBuf, tft.width() / 2, 110);
+
+        // Info line 2: elapsed time
+        snprintf(infoBuf, sizeof(infoBuf), "Elapsed: %02lu:%02lu",
+                 elapsedSec / 60, elapsedSec % 60);
+        tft.drawString(infoBuf, tft.width() / 2, 125);
+
+        // Footer
+        tft.fillRect(0, 218, 320, 22, TFT_BLACK);
+        tft.setTextColor(0x4208);
+        tft.drawString("Click: Pause  Long: Stop", tft.width() / 2, 228);
+
+        tft.setTextDatum(top_left);
+        xSemaphoreGive(spiMutex);
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
+  Serial.printf("[TL] Timelapse ended. %d photos in %lus.\n",
+                captureCount, (millis() - startTime) / 1000);
+
+  // Reinit camera to IDLE preview mode and return
+  initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    xSemaphoreGive(spiMutex);
+  }
+  appState = STATE_IDLE;
 }
 
 // ================= MENU HELPERS =================
