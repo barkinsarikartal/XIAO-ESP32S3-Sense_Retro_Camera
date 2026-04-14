@@ -65,7 +65,7 @@ function switchTab(t){
 function renderFiles(){
  let el=document.getElementById('list');
  let filtered=allFiles.filter(f=>curTab==='videos'?f.isVideo:!f.isVideo);
- filtered.sort((a,b)=>a.name.localeCompare(b.name));
+ filtered.sort((a,b)=>b.name.localeCompare(a.name,undefined,{numeric:true}));
  if(!filtered.length){el.innerHTML='<div class="empty">No '+(curTab==='videos'?'videos':'photos')+' on SD card</div>';return;}
  let h='';
  filtered.forEach(f=>{
@@ -201,8 +201,9 @@ void startWiFiMode() {
     request->send(200, "application/json", json);
   });
 
-  // Route: download file (chunked stream, forced download via HTML download attr)
+  // Route: download file (Content-Length aware, forced download via HTML download attr)
   // Uses shared_ptr<File> so the file is auto-closed if client disconnects mid-transfer.
+  // Content-Length is set explicitly so browsers can show download progress.
   webServer->on("/api/download", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!request->hasParam("file")) {
       request->send(400, "text/plain", "Missing file param");
@@ -215,12 +216,14 @@ void startWiFiMode() {
     String filename = request->getParam("file")->value();
     if (!filename.startsWith("/")) filename = "/" + filename;
 
-    // Open file with mutex — shared_ptr ensures RAII cleanup
+    // Open file and read its size — shared_ptr ensures RAII cleanup
     auto fp = std::make_shared<File>();
     bool opened = false;
+    size_t fileSize = 0;
     if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
       *fp = SD.open(filename, FILE_READ);
       opened = (bool)*fp;
+      if (opened) fileSize = fp->size();
       xSemaphoreGive(spiMutex);
     }
     if (!opened) {
@@ -235,6 +238,8 @@ void startWiFiMode() {
     int slash = basename.lastIndexOf('/');
     if (slash >= 0) basename = basename.substring(slash + 1);
 
+    // Use chunked response but set Content-Length header explicitly.
+    // This lets browsers know the total size for download progress bars.
     AsyncWebServerResponse *response = request->beginChunkedResponse(
       contentType.c_str(),
       [fp](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
@@ -252,6 +257,7 @@ void startWiFiMode() {
     );
     // Force browser to save with the original filename (e.g. vid_1.avi, hd_pic_2.jpg)
     response->addHeader("Content-Disposition", "attachment; filename=\"" + basename + "\"");
+    response->addHeader("Content-Length", String(fileSize));
     request->send(response);
   });
 

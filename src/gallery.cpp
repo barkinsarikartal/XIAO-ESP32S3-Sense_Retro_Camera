@@ -48,8 +48,37 @@ void scanGalleryFiles(bool videosOnly) {
   }
 
   galleryFileCount = count;
+
+  // Sort descending by embedded number (newest/highest first).
+  // Filenames follow patterns like /hd_pic_42.jpg, /vid_7.avi.
+  // Extract trailing number for numeric comparison so pic_10 > pic_9.
+  if (galleryFileCount > 1) {
+    // Simple insertion sort — gallery sizes are small (hundreds of files)
+    for (int i = 1; i < galleryFileCount; i++) {
+      char *key = galleryFiles[i];
+      // Extract number from key
+      const char *p = key + strlen(key) - 1;
+      while (p > key && *p != '_') p--;
+      int keyNum = (p > key) ? atoi(p + 1) : 0;
+
+      int j = i - 1;
+      while (j >= 0) {
+        const char *q = galleryFiles[j] + strlen(galleryFiles[j]) - 1;
+        while (q > galleryFiles[j] && *q != '_') q--;
+        int jNum = (q > galleryFiles[j]) ? atoi(q + 1) : 0;
+        if (jNum < keyNum) {
+          galleryFiles[j + 1] = galleryFiles[j];
+          j--;
+        } else {
+          break;
+        }
+      }
+      galleryFiles[j + 1] = key;
+    }
+  }
+
   galleryIndex = 0;
-  Serial.printf("[GAL] Found %d %s files\n", count, videosOnly ? "video" : "photo");
+  Serial.printf("[GAL] Found %d %s files\n", galleryFileCount, videosOnly ? "video" : "photo");
 }
 
 // Release gallery file index memory.

@@ -118,7 +118,7 @@
 
 // ================= MENU =================
 #define MENU_MAIN_ITEMS 5
-#define SETTINGS_COUNT  11
+#define SETTINGS_COUNT  12
 
 // ================= APP STATE & EVENTS =================
 enum AppState {
@@ -255,6 +255,7 @@ extern volatile bool galleryNeedsRedraw;
 extern int menuMainSelection;
 extern int settingsIndex;
 extern bool settingsEditing;
+extern int resetCounterConfirm;  // 0=No, 1=Yes — for counter reset confirmation
 
 // Encoder ISR state
 extern volatile uint8_t encPrevState;

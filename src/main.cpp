@@ -62,6 +62,7 @@ volatile bool galleryNeedsRedraw = false;
 int menuMainSelection = 0;
 int settingsIndex = 0;
 bool settingsEditing = false;
+int resetCounterConfirm = 0;
 
 // Encoder ISR state — DRAM_ATTR keeps these in internal SRAM so ISRs
 // can access them safely even during flash cache misses (e.g. SD writes).
@@ -728,6 +729,7 @@ static void taskInput(void *pvParameters) {
                 galleryNeedsRedraw = true;
                 if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
               } else if (ev.type == INPUT_ENC_CLICK) {
+                resetCounterConfirm = 0;  // safety: always start at "No"
                 settingsEditing = true;
                 galleryNeedsRedraw = true;
                 if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
@@ -741,6 +743,67 @@ static void taskInput(void *pvParameters) {
               }
             } else {
               // Editing mode: CW/CCW adjust value, CLICK confirms
+
+              // Special case: counter reset (index 11) — action-type setting
+              if (settingsIndex == 11) {
+                if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
+                  resetCounterConfirm = 1 - resetCounterConfirm;
+                  galleryNeedsRedraw = true;
+                  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                } else if (ev.type == INPUT_ENC_CLICK) {
+                  if (resetCounterConfirm == 1) {
+                    // Execute counter reset
+                    pictureNumber = 0;
+                    videoNumber = 0;
+                    { Preferences p; p.begin("cnt", false); p.putInt("pic", 0); p.putInt("vid", 0); p.end(); }
+                    Serial.println("[NVS] File counters reset to 0.");
+
+                    // Show warning on TFT
+                    settingsEditing = false;
+                    resetCounterConfirm = 0;
+                    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+                      tft.fillScreen(TFT_BLACK);
+                      tft.setTextDatum(middle_center);
+                      tft.setTextSize(2);
+                      tft.setTextColor(TFT_GREEN);
+                      tft.drawString("Counters Reset!", tft.width() / 2, 40);
+                      tft.setTextSize(1);
+                      tft.setTextColor(TFT_YELLOW);
+                      tft.drawString("P:0  V:0", tft.width() / 2, 70);
+                      tft.setTextSize(2);
+                      tft.setTextColor(TFT_RED);
+                      tft.drawString("!! WARNING !!", tft.width() / 2, 110);
+                      tft.setTextSize(1);
+                      tft.setTextColor(TFT_WHITE);
+                      tft.drawString("Gallery will show wrong", tft.width() / 2, 140);
+                      tft.drawString("files after counter reset.", tft.width() / 2, 155);
+                      tft.setTextColor(TFT_CYAN);
+                      tft.drawString("Backup your photos/videos", tft.width() / 2, 180);
+                      tft.drawString("via WiFi, then delete them", tft.width() / 2, 195);
+                      tft.drawString("from SD card.", tft.width() / 2, 210);
+                      tft.setTextDatum(top_left);
+                      xSemaphoreGive(spiMutex);
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(4000));
+                    galleryNeedsRedraw = true;
+                    if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                  } else {
+                    // "No" selected — cancel
+                    settingsEditing = false;
+                    resetCounterConfirm = 0;
+                    galleryNeedsRedraw = true;
+                    if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                  }
+                } else if (ev.type == INPUT_ENC_LONG) {
+                  // Cancel
+                  settingsEditing = false;
+                  resetCounterConfirm = 0;
+                  galleryNeedsRedraw = true;
+                  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                }
+                break;  // handled — skip normal val logic
+              }
+
               int *val = nullptr;
               int lo = 0, hi = 0;
               switch (settingsIndex) {

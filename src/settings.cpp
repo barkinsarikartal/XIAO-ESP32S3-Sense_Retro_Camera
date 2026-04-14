@@ -108,7 +108,7 @@ void drawSettingsMenu() {
   static const char* const names[SETTINGS_COUNT] = {
     "Bright", "Contr", "Satur", "AE Lv",
     "WB", "FX", "Mirror", "Flip", "JPEG Q",
-    "TL Int", "Rec Lim"
+    "TL Int", "Rec Lim", "Rst Cnt"
   };
   // White balance mode labels
   static const char* const wbLabels[] = {
@@ -124,7 +124,8 @@ void drawSettingsMenu() {
     camSettings.brightness, camSettings.contrast, camSettings.saturation,
     camSettings.ae_level, camSettings.wb_mode, camSettings.special_effect,
     camSettings.hmirror, camSettings.vflip, camSettings.jpeg_quality,
-    camSettings.timelapse_interval, camSettings.rec_max_seconds
+    camSettings.timelapse_interval, camSettings.rec_max_seconds,
+    resetCounterConfirm  // 0=No, 1=Yes
   };
 
   if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
@@ -169,7 +170,14 @@ void drawSettingsMenu() {
       // Value (right)
       tft.setTextDatum(middle_right);
       char valBuf[16];
-      if (i == 4) {
+      if (i == 11) {
+        // Counter reset — show No/Yes in edit mode, P:N V:N otherwise
+        if (editing) {
+          snprintf(valBuf, sizeof(valBuf), "%s", vals[i] ? "YES" : "No");
+        } else {
+          snprintf(valBuf, sizeof(valBuf), "P:%d V:%d", pictureNumber, videoNumber);
+        }
+      } else if (i == 4) {
         // WB mode — show label
         snprintf(valBuf, sizeof(valBuf), "%s", wbLabels[constrain(vals[i], 0, 4)]);
       } else if (i == 5) {
