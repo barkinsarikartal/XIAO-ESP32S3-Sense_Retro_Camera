@@ -1,170 +1,10 @@
-#include <Arduino.h>
-#include <LovyanGFX.hpp>
-#include <Preferences.h>
-#include <WiFi.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include "esp_camera.h"
-#include "esp_bt.h"
-#include "FS.h"
-#include "SD.h"
-#include "SPI.h"
-#include "img_converters.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/semphr.h"
-#include "freertos/queue.h"
-#include "freertos/event_groups.h"
-#include "driver/i2s_pdm.h"
-#include <atomic>
-#include <memory>
-
-//   TFT Pin         ->     XIAO ESP32-S3
-//     VCC           ->          3V3
-//     GND           ->          GND
-//     CS            ->         GPIO1
-//    RESET          ->         GPIO3
-//     A0            ->         GPIO2
-//     SDA           ->         GPIO9
-//     SCK           ->         GPIO7
-//     LED           ->          3V3
-
-// SHUTTER BUTTON    ->    XIAO ESP32-S3
-//      1            ->        GPIO4
-//      2            ->        GPIO5
-
-// Rotary Encoder    ->    XIAO ESP32-S3
-//      CLK          ->        GPIO6
-//      DT           ->        GPIO43
-//      SW           ->        GPIO44
-
-// ================= EXTERNAL PINS =================
-#define TFT_CS            1
-#define TFT_DC            2
-#define TFT_RST           3
-#define TFT_SCK           7
-#define TFT_MISO          8
-#define TFT_MOSI          9
-
-#define BTN_PIN           0  // boot button on XIAO (used for mirroring the image)
-#define SD_CS_PIN         21 // SD card CS pin on XIAO ESP32S3 Sense
-
-#define SHUTTER_BTN_PIN_1 4
-#define SHUTTER_BTN_PIN_2 5
-
-// ================= MIC PINS (XIAO ESP32-S3 Sense built-in PDM) =================
-#define I2S_MIC_CLK_PIN   42
-#define I2S_MIC_DATA_PIN  41
-
-// ================= CAM PINS (XIAO ESP32-S3 Sense) =================
-#define PWDN_GPIO_NUM     -1
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM     10
-#define SIOD_GPIO_NUM     40
-#define SIOC_GPIO_NUM     39
-
-#define Y9_GPIO_NUM       48
-#define Y8_GPIO_NUM       11
-#define Y7_GPIO_NUM       12
-#define Y6_GPIO_NUM       14
-#define Y5_GPIO_NUM       16
-#define Y4_GPIO_NUM       18
-#define Y3_GPIO_NUM       17
-#define Y2_GPIO_NUM       15
-#define VSYNC_GPIO_NUM    38
-#define HREF_GPIO_NUM     47
-#define PCLK_GPIO_NUM     13
+#include "shared.h"
 
 // ================= NVS NAMESPACES =================
 // "cnt" — file counters (pictureNumber, videoNumber)
 // "cam" — camera sensor settings (CameraSettings struct)
 
-// ================= CAMERA SETTINGS =================
-#define PHOTO_MODE        PIXFORMAT_JPEG
-#define PHOTO_RESOLUTION  FRAMESIZE_HD
-
-#define VIDEO_MODE        PIXFORMAT_JPEG
-#define VIDEO_RESOLUTION  FRAMESIZE_HVGA
-
-#define IDLE_MODE         PIXFORMAT_RGB565
-#define IDLE_RESOLUTION   FRAMESIZE_QVGA
-
-#define REC_JPEG_QUALITY  12
-#define IDLE_JPEG_QUALITY 0
-
-// ================= FIRMWARE VERSION =================
-#define FIRMWARE_VERSION "v0.9"
-
-// ================= WIFI AP CONFIG =================
-#define WIFI_SSID "Retro_Cam"
-#define WIFI_PASS "barkinsarikartal"
-
-// ================= DEBUG FLAGS =================
-// Set to 1 to enable Serial.printf for every InputEvent sent.
-#define DEBUG_INPUT 1
-
-// ================= AUDIO SETTINGS =================
-#define AUDIO_SAMPLE_RATE       16000
-#define AUDIO_REC_BUF_SIZE       8192
-
-// ================= VIDEO / AUDIO TIMING =================
-// A single constant for declared FPS keeps the AVI header, the audio chunk
-// size, and the I2S DMA geometry all in sync with each other.
-#define TARGET_FPS               10
-#define AUDIO_SAMPLES_PER_FRAME  (AUDIO_SAMPLE_RATE / TARGET_FPS)   // 1600 samples
-#define AUDIO_BYTES_PER_FRAME    (AUDIO_SAMPLES_PER_FRAME * 2)      // 3200 bytes
-
-// ================= AVI CAPACITY =================
-// Pre-sized for max ~15 min @ 10 FPS. Allocated once at boot to avoid PSRAM fragmentation.
-#define MAX_AVI_FRAMES  9000          // 10 FPS × 900 sec
-#define MAX_AVI_CHUNKS  (MAX_AVI_FRAMES * 2)  // V+A interleaved
-
-// ================= APP STATE & EVENTS =================
-enum AppState {
-  STATE_IDLE,
-  STATE_RECORDING,
-  STATE_PHOTO,
-  STATE_STOPPING,
-  STATE_MENU_MAIN,
-  STATE_GALLERY_TYPE,
-  STATE_GALLERY_PHOTOS,
-  STATE_GALLERY_VIDEOS,
-  STATE_VIDEO_PLAYING,
-  STATE_DELETE_CONFIRM,
-  STATE_WIFI_MODE,
-  STATE_SETTINGS,
-};
-volatile AppState appState = STATE_IDLE;
-
-#define EVT_START_RECORDING  (1 << 0)
-#define EVT_STOP_RECORDING   (1 << 1)
-#define EVT_TAKE_PHOTO       (1 << 2)
-#define EVT_SD_STOP          (1 << 3)
-EventGroupHandle_t appEvents;
-
-// ================= INPUT EVENT QUEUE =================
-// Queue-based input pipeline replaces direct EventGroup GPIO signals.
-enum InputEventType {
-  INPUT_BTN_SHORT,   // shutter short press
-  INPUT_BTN_LONG,    // shutter long press
-  INPUT_BOOT_SHORT,  // boot button short press
-  INPUT_BOOT_LONG,   // boot button long press
-  INPUT_ENC_CW,      // encoder clockwise
-  INPUT_ENC_CCW,     // encoder counter-clockwise
-  INPUT_ENC_CLICK,   // encoder button short tap
-  INPUT_ENC_LONG,    // encoder button long press (>500 ms)
-};
-struct InputEvent { InputEventType type; };
-QueueHandle_t inputEventQueue = NULL;
-
-// ================= WIFI FILE SERVER =================
-AsyncWebServer *webServer = nullptr;
-
-// ================= ENCODER PINS =================
-#define ENC_CLK  6
-#define ENC_DT   43
-#define ENC_SW   44
-
+// ================= ENCODER STATE TABLE =================
 // Quadrature state table — DRAM_ATTR ensures ISR-safe access during flash operations.
 // Index = (prevState << 2) | currState, where state = (CLK << 1) | DT.
 // +1 = CW step, -1 = CCW step, 0 = invalid/bounce (ignored).
@@ -174,13 +14,62 @@ static const DRAM_ATTR int8_t ENC_TABLE[16] = {
   -1,  0,  0,  1,
    0,  1, -1,  0
 };
-volatile uint8_t encPrevState = 3;  // both HIGH at boot (INPUT_PULLUP default)
-volatile int8_t  encAccum     = 0;  // direction accumulator between detents
-volatile uint32_t encSwPressMs = 0; // timestamp of SW button press edge
+
+// ================= GLOBAL VARIABLE DEFINITIONS =================
+// All globals declared as extern in shared.h are defined here (except
+// AVI writer globals in avi_writer.cpp and webServer in wifi_server.cpp).
+
+LGFX tft;
+SemaphoreHandle_t spiMutex;
+volatile AppState appState = STATE_IDLE;
+EventGroupHandle_t appEvents;
+QueueHandle_t inputEventQueue = NULL;
+SDStatus globalSDState = {false, false, "NO CARD"};
+CameraSettings camSettings = { 1, 0, 2, 0, 0, 0, 1, 0, 12 };
+camera_config_t config;
+int pictureNumber = 0;
+int videoNumber = 0;
+unsigned long recordingStartTime = 0;
+File videoFile;
+TaskHandle_t taskDisplayHandle = NULL;
+
+// Display double buffer
+uint8_t *dispBuf[2] = {nullptr, nullptr};
+volatile size_t dispLen[2] = {0, 0};
+std::atomic<int> dispWriteSlot{0};
+std::atomic<int> dispReadSlot{-1};
+std::atomic<int> dispRendering{-1};
+
+// Recorder pool
+uint8_t *recPool[REC_POOL_SIZE] = {nullptr, nullptr, nullptr};
+QueueHandle_t recFrameQueue = NULL;
+SemaphoreHandle_t recPoolFree = NULL;
+int recPoolWriteIdx = 0;
+
+// Audio
+int16_t *audioRecBuf = nullptr;
+i2s_chan_handle_t i2s_rx_handle = NULL;
+
+// Gallery state
+char **galleryFiles = nullptr;
+int galleryFileCount = 0;
+int galleryIndex = 0;
+int galleryTypeSelection = 0;
+int deleteSelection = 0;
+volatile bool galleryNeedsRedraw = false;
+
+// Menu state
+int menuMainSelection = 0;
+int settingsIndex = 0;
+bool settingsEditing = false;
+
+// Encoder ISR state
+volatile uint8_t encPrevState = 3;   // both HIGH at boot (INPUT_PULLUP default)
+volatile int8_t  encAccum     = 0;   // direction accumulator between detents
+volatile uint32_t encSwPressMs = 0;  // timestamp of SW button press edge
 
 // Debug counters: ISR increments, taskInput reads and prints the delta.
 // Safe because uint32 reads/writes are atomic on Xtensa; no mutex needed.
-// These are only active when DEBUG_INPUT=1.
 #if DEBUG_INPUT
 volatile uint32_t dbgEncCw    = 0;
 volatile uint32_t dbgEncCcw   = 0;
@@ -188,177 +77,16 @@ volatile uint32_t dbgEncClick = 0;
 volatile uint32_t dbgEncLong  = 0;
 #endif
 
-// ================= STRUCTS & GLOBALS =================
-struct SDStatus {
-  bool isMounted;
-  bool isFull;
-  String errorMsg;
-};
-
-SDStatus globalSDState = {false, false, "NO CARD"};
-int pictureNumber = 0;
-int videoNumber = 0;
-bool mirror = true;
-unsigned long recordingStartTime = 0;
-File videoFile;
-
-// ================= GALLERY =================
-#define GALLERY_MAX_FILES  2000
-#define GALLERY_NAME_LEN   24
-char **galleryFiles = nullptr;
-int galleryFileCount = 0;
-int galleryIndex = 0;
-int galleryTypeSelection = 0;   // 0=Photos, 1=Videos
-int deleteSelection = 0;        // 0=Cancel, 1=Delete
-volatile bool galleryNeedsRedraw = false;
-
-// ================= MAIN MENU =================
-int menuMainSelection = 0;  // 0=Gallery, 1=WiFi, 2=Settings, 3=Exit
-#define MENU_MAIN_ITEMS 4
-
-// ================= SETTINGS MENU =================
-// Settings parameter descriptors for the encoder-driven settings UI.
-// settingsIndex: which setting is highlighted (0..SETTINGS_COUNT-1)
-// settingsEditing: true when the user is modifying the value (ENC_CW/CCW change value)
-int settingsIndex = 0;
-bool settingsEditing = false;
-#define SETTINGS_COUNT 9
-
-// ================= CAMERA SETTINGS =================
-// Persistent camera parameters, loaded from NVS at boot, applied after each initCamera.
-struct CameraSettings {
-  int brightness;     // -2..+2   (default: 1)
-  int contrast;       // -2..+2   (default: 0)
-  int saturation;     // -2..+2   (default: 2)
-  int ae_level;       // -2..+2   (default: 0)
-  int wb_mode;        // 0=Auto 1=Sunny 2=Cloudy 3=Office 4=Home
-  int special_effect; // 0=None 1=Neg 2=Gray 3=Red 4=Green 5=Blue 6=Sepia
-  int hmirror;        // 0/1      (default: 1)
-  int vflip;          // 0/1      (default: 0)
-  int jpeg_quality;   // 4=Max..63=Low, inverse scale (default: 12)
-};
-CameraSettings camSettings = { 1, 0, 2, 0, 0, 0, 1, 0, 12 };
-
-// Single SPI mutex: TFT and SD share the same SPI bus (SPI2_HOST),
-// so all SPI operations must be serialized to prevent bus corruption.
-SemaphoreHandle_t spiMutex;
-
-camera_config_t config;
-
-// ================= AVI HEADER VARIABLES =================
-const int avi_header_size = 324;
-long avi_movi_size = 0;
-long avi_index_size = 0;
-unsigned long avi_start_time = 0;
-int avi_total_frames = 0;
-uint32_t *avi_frame_sizes = nullptr;
-const int avi_frame_capacity = MAX_AVI_FRAMES;  // fixed at boot, never changes
-uint32_t *avi_audio_sizes = nullptr;
-int avi_total_audio_chunks = 0;
-uint8_t *avi_chunk_order = nullptr;  // 0=video, 1=audio — tracks actual file layout for correct idx1
-int avi_total_chunks = 0;
-
-// ================= MICROPHONE =================
-i2s_chan_handle_t i2s_rx_handle = NULL;
-
-// ================= FRAME MANAGEMENT =================
-// Display double buffer (ping-pong): decouples capture from TFT rendering
-// Separate sizes to reduce PSRAM usage: display needs 160KB (QVGA RGB565 = 150KB,
-// HD JPEG gallery < 160KB), but recorder only needs 80KB (HVGA JPEG @ q12 ≈ 15-25KB).
-#define DISP_BUF_SIZE      (160 * 1024)  // display + gallery JPEG decode
-#define REC_BUF_SIZE       (80 * 1024)   // HVGA JPEG frames during recording
-uint8_t *dispBuf[2] = {nullptr, nullptr};
-volatile size_t dispLen[2] = {0, 0};
-// std::atomic gives correct memory-ordering guarantees on ESP32-S3 SMP.
-// volatile alone is insufficient for inter-core visibility.
-std::atomic<int> dispWriteSlot{0};
-std::atomic<int> dispReadSlot{-1};
-std::atomic<int> dispRendering{-1};  // slot currently being rendered by taskDisplay (-1 = none)
-TaskHandle_t taskDisplayHandle = NULL;
-
-// Recorder frame pool: 3 PSRAM slots so capture never blocks on recorder
-#define REC_POOL_SIZE  3
-uint8_t *recPool[REC_POOL_SIZE] = {nullptr, nullptr, nullptr};
-typedef struct { int idx; size_t len; } RecFrame;
-QueueHandle_t recFrameQueue = NULL;
-SemaphoreHandle_t recPoolFree = NULL;
-int recPoolWriteIdx = 0;
-
-// ================= AUDIO BUFFER =================
-int16_t *audioRecBuf = nullptr;  // direct I2S read buffer for recorder
-
-// ================= TFT CLASS =================
-class LGFX : public lgfx::LGFX_Device {
-  lgfx::Panel_ST7789 _panel;
-  lgfx::Bus_SPI _bus;
-
-public:
-  LGFX() {
-    auto bcfg = _bus.config();
-    bcfg.spi_host = SPI2_HOST;
-    bcfg.spi_mode = 0;
-    bcfg.freq_write = 80000000; // 80 MHz
-    bcfg.pin_sclk = TFT_SCK;
-    bcfg.pin_mosi = TFT_MOSI;
-    bcfg.pin_miso = TFT_MISO;
-    bcfg.pin_dc   = TFT_DC;
-    _bus.config(bcfg);
-    _panel.setBus(&_bus);
-
-    auto pcfg = _panel.config();
-    pcfg.pin_cs = TFT_CS;
-    pcfg.pin_rst = TFT_RST;
-    pcfg.panel_width  = 240;
-    pcfg.panel_height = 320;
-    pcfg.offset_x = 0;
-    pcfg.offset_y = 0;
-    pcfg.invert = true;
-    pcfg.rgb_order = false;
-    pcfg.readable = false;
-
-    _panel.config(pcfg);
-
-    setPanel(&_panel);
-  }
-};
-
-LGFX tft;
-
-// ================= FUNCTION PROTOTYPES =================
-void taskSDMonitor(void *pvParameters);
-void taskCapture(void *pvParameters);
-void taskDisplay(void *pvParameters);
-void taskRecorder(void *pvParameters);
-void taskInput(void *pvParameters);
-void savePhotoHighRes();
-void initCamera(pixformat_t format, framesize_t size, int jpeg_quality);
-void startAVI(File &file, int fps, int width, int height);
-bool writeAVIFrameFromBuf(File &file, uint8_t *buf, size_t len);
-bool writeAVIAudioChunk(File &file, uint8_t *buf, size_t bytes);
-void endAVI(File &file, int fps, int width, int height);
-void initMicrophone();
-void deinitMicrophone();
-void allocateBuffers();
+// ================= TASK PROTOTYPES (file-local) =================
+static void taskSDMonitor(void *pvParameters);
+static void taskCapture(void *pvParameters);
+static void taskDisplay(void *pvParameters);
+static void taskRecorder(void *pvParameters);
+static void taskInput(void *pvParameters);
+static void savePhotoHighRes();
 static void drawStatusBar(float fps);
-void loadCameraSettings();
-void saveCameraSettings();
-void applySettings(sensor_t *s);
-void startWiFiMode();
-void stopWiFiMode();
-void scanGalleryFiles(bool videosOnly);
-void freeGalleryFiles();
-void drawMenuMain();
-void drawGalleryTypeMenu();
-void drawGalleryPhoto();
-void drawGalleryVideoItem();
-size_t extractAVIFrame(File &aviFile, uint8_t *buf, size_t bufSize, int targetFrame);
-void drawDeleteConfirm();
-void drawSettingsMenu();
-void playVideoOnTFT();
-void enterMenuMain();
-void exitMenuToIdle();
-void encoderISR();
-void encSwISR();
+static void encoderISR();
+static void encSwISR();
 
 // ================= SETUP =================
 void setup() {
@@ -368,10 +96,9 @@ void setup() {
   WiFi.mode(WIFI_OFF);
   esp_bt_controller_disable();
 
-  pinMode(BTN_PIN, INPUT_PULLUP);
+  // Boot button (GPIO 0) no longer used — mirror and WiFi are in encoder menu.
   pinMode(SHUTTER_BTN_PIN_1, OUTPUT);
   pinMode(SHUTTER_BTN_PIN_2, INPUT_PULLUP);
-
   digitalWrite(SHUTTER_BTN_PIN_1, LOW);
 
   pinMode(ENC_CLK, INPUT_PULLUP);
@@ -402,7 +129,7 @@ void setup() {
   tft.drawString("github@barkinsarikartal", tft.width() / 2, 200); // mini ad here :)
   tft.setTextDatum(top_left);
 
-  // Load file counters from NVS (replaces EEPROM)
+  // Load file counters from NVS
   {
     Preferences p;
     p.begin("cnt", true);  // read-only
@@ -413,7 +140,6 @@ void setup() {
 
   // Load camera settings from NVS
   loadCameraSettings();
-  mirror = camSettings.hmirror;  // runtime mirror tracks saved preference
 
   Serial.printf("Initial image no: %d, video no: %d\n", pictureNumber, videoNumber);
 
@@ -499,10 +225,42 @@ void allocateBuffers() {
                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
+// ================= HELPER: TFT MESSAGE =================
+// Shows a centred message on the TFT (acquires spiMutex internally).
+// If durationMs > 0, blocks the calling task for that duration.
+void showTFTMessage(const char *msg, uint16_t color, int durationMs) {
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillRect(0, 80, 320, 60, TFT_BLACK);
+    tft.setTextDatum(middle_center);
+    tft.setTextSize(2);
+    tft.setTextColor(color);
+    tft.drawString(msg, tft.width() / 2, 110);
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+  if (durationMs > 0) vTaskDelay(pdMS_TO_TICKS(durationMs));
+}
 
+// ================= HELPER: EMERGENCY EXIT =================
+// Exits any menu/gallery state back to IDLE. Reverts uncommitted settings edits,
+// frees gallery memory, reinits camera and clears the screen.
+void emergencyExitToIdle() {
+  Serial.println("[MENU] Emergency exit -> IDLE");
+  if (settingsEditing) {
+    loadCameraSettings();
+    settingsEditing = false;
+  }
+  freeGalleryFiles();
+  initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    xSemaphoreGive(spiMutex);
+  }
+  appState = STATE_IDLE;
+}
 
 // ================= TASK: SD MONITOR (Core 0, Priority 1) =================
-void taskSDMonitor(void *pvParameters) {
+static void taskSDMonitor(void *pvParameters) {
   while (true) {
     // WiFi mode: lightweight SD presence check only.
     // Skip remount attempts (SD.end/begin) to avoid colliding with active downloads.
@@ -606,37 +364,33 @@ void taskSDMonitor(void *pvParameters) {
 //
 // Queue-based input pipeline.
 // All physical inputs are translated into InputEvent and pushed to inputEventQueue.
-// Encoder ISRs push CW/CCW/CLICK/LONG directly; buttons are polled here.
+// Encoder ISRs push CW/CCW/CLICK/LONG directly; shutter button is polled here.
 //
 // State machine:
-//   IDLE → ENC_CLICK → MENU_MAIN → (Gallery | WiFi | Settings | Exit)
+//   IDLE -> ENC_CLICK -> MENU_MAIN -> (Gallery | WiFi | Settings | Exit)
 //   ENC_LONG = universal "go back one level"
 //   SHUTTER short = photo (IDLE), stop recording, or emergency exit from any menu
 //   SHUTTER long  = start recording (from IDLE or any menu — auto-exits first)
-//   BOOT short    = mirror toggle (IDLE only)
-//   BOOT long     = WiFi mode (IDLE), exit WiFi mode (WIFI_MODE)
-void taskInput(void *pvParameters) {
+//
+// Boot button disabled in Phase 10 — mirror toggle and WiFi entry handled via encoder menu.
+static void taskInput(void *pvParameters) {
   bool lastShutter = HIGH;
-  bool lastBoot    = HIGH;
   unsigned long shutterPressTime = 0;
-  unsigned long bootPressTime    = 0;
 
   auto sendEvent = [](InputEventType t) {
     InputEvent e = { t };
     xQueueSend(inputEventQueue, &e, 0);
 #if DEBUG_INPUT
-    // Map enum to readable name for Serial output.
     static const char* const names[] = {
-      "BTN_SHORT", "BTN_LONG", "BOOT_SHORT", "BOOT_LONG",
+      "BTN_SHORT", "BTN_LONG",
       "ENC_CW",   "ENC_CCW",  "ENC_CLICK",  "ENC_LONG"
     };
-    Serial.printf("[INPUT] %s\n", (t < 8) ? names[t] : "?");
+    Serial.printf("[INPUT] %s\n", (t < 6) ? names[t] : "?");
 #endif
   };
 
   while (true) {
     bool shutterNow = digitalRead(SHUTTER_BTN_PIN_2);
-    bool bootNow    = digitalRead(BTN_PIN);
 
     // ── SHUTTER press edge ──
     if (lastShutter == HIGH && shutterNow == LOW) {
@@ -650,7 +404,7 @@ void taskInput(void *pvParameters) {
       if (dur < 1000) {
         // Short press
         if (appState == STATE_IDLE) {
-          // Legacy: fire photo event
+          // Take photo
           bool canSave = false;
           String errMsg = "";
           if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
@@ -663,13 +417,7 @@ void taskInput(void *pvParameters) {
             xEventGroupSetBits(appEvents, EVT_TAKE_PHOTO);
             sendEvent(INPUT_BTN_SHORT);
           } else {
-            if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-              tft.setTextSize(2);
-              tft.setCursor(10, 10);
-              tft.setTextColor(TFT_RED, TFT_BLACK);
-              tft.print(errMsg);
-              xSemaphoreGive(spiMutex);
-            }
+            showTFTMessage(errMsg.c_str(), TFT_RED, 1000);
           }
         } else if (appState == STATE_RECORDING && millis() - recordingStartTime > 2000) {
           // Stop recording
@@ -679,27 +427,14 @@ void taskInput(void *pvParameters) {
                    appState == STATE_GALLERY_TYPE || appState == STATE_GALLERY_PHOTOS ||
                    appState == STATE_GALLERY_VIDEOS || appState == STATE_DELETE_CONFIRM ||
                    appState == STATE_VIDEO_PLAYING) {
-          // Emergency exit from any gallery/menu state → IDLE
-          Serial.println("[MENU] Shutter short press → exit to IDLE");
-          // Revert uncommitted settings edit if active
-          if (settingsEditing) {
-            loadCameraSettings();
-            mirror = camSettings.hmirror;
-            settingsEditing = false;
-          }
-          freeGalleryFiles();
-          initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
-          if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-            tft.fillScreen(TFT_BLACK);
-            xSemaphoreGive(spiMutex);
-          }
-          appState = STATE_IDLE;
+          // Emergency exit from any gallery/menu state -> IDLE
+          emergencyExitToIdle();
         }
       }
       // Long press released — already handled below via held detection
     }
 
-    // ── SHUTTER held long (>1s) → start recording ──
+    // ── SHUTTER held long (>1s) -> start recording ──
     // Works from IDLE or any gallery state (exits gallery first, reinits camera)
     {
       AppState cs = appState;
@@ -712,19 +447,7 @@ void taskInput(void *pvParameters) {
         // Exit menu/gallery first if needed
         if (isMenu) {
           Serial.println("[MENU] Shutter long press -> exit menu, start recording");
-          // Revert uncommitted settings edit if active
-          if (settingsEditing) {
-            loadCameraSettings();
-            mirror = camSettings.hmirror;
-            settingsEditing = false;
-          }
-          freeGalleryFiles();
-          initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
-          if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-            tft.fillScreen(TFT_BLACK);
-            xSemaphoreGive(spiMutex);
-          }
-          appState = STATE_IDLE;
+          emergencyExitToIdle();
         }
 
         bool cardReady = false;
@@ -744,42 +467,8 @@ void taskInput(void *pvParameters) {
           }
           shutterPressTime = 0;  // re-arm
         } else {
-          if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-            tft.setTextSize(2);
-            tft.setCursor(10, 10);
-            tft.setTextColor(TFT_RED, TFT_BLACK);
-            tft.print(errorMsg);
-            xSemaphoreGive(spiMutex);
-          }
-          vTaskDelay(pdMS_TO_TICKS(1000));
+          showTFTMessage(errorMsg.c_str(), TFT_RED, 1000);
           shutterPressTime = 0;
-        }
-      }
-    }
-
-    // ── BOOT press edge ──
-    if (lastBoot == HIGH && bootNow == LOW) {
-      bootPressTime = millis();
-    }
-
-    // ── BOOT release edge ──
-    if (lastBoot == LOW && bootNow == HIGH) {
-      unsigned long dur = millis() - bootPressTime;
-      if (dur < 800) {
-        if (appState == STATE_IDLE) {
-          mirror = !mirror;
-          sensor_t *s = esp_camera_sensor_get();
-          if (s) s->set_hmirror(s, mirror);
-          sendEvent(INPUT_BOOT_SHORT);
-        }
-      } else {
-        // Long press: enter WiFi mode from IDLE, exit from WIFI
-        if (appState == STATE_IDLE) {
-          sendEvent(INPUT_BOOT_LONG);
-          startWiFiMode();
-        } else if (appState == STATE_WIFI_MODE) {
-          sendEvent(INPUT_BOOT_LONG);
-          stopWiFiMode();
         }
       }
     }
@@ -796,23 +485,8 @@ void taskInput(void *pvParameters) {
         switch (appState) {
           case STATE_IDLE:
             if (ev.type == INPUT_ENC_CLICK) {
-              if (!globalSDState.isMounted) {
-                // Temporarily block camera rendering so message stays visible
-                appState = STATE_PHOTO;
-                if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-                  tft.fillRect(0, 80, 320, 60, TFT_BLACK);
-                  tft.setTextDatum(middle_center);
-                  tft.setTextSize(2);
-                  tft.setTextColor(TFT_RED);
-                  tft.drawString("NO SD CARD!", tft.width() / 2, 110);
-                  tft.setTextDatum(top_left);
-                  xSemaphoreGive(spiMutex);
-                }
-                vTaskDelay(pdMS_TO_TICKS(1500));
-                appState = STATE_IDLE;
-                break;
-              }
-
+              // Menu is always accessible regardless of SD state.
+              // SD checks happen per-item (Gallery, WiFi) inside STATE_MENU_MAIN.
               menuMainSelection = 0;
               galleryNeedsRedraw = true;
               enterMenuMain();
@@ -830,16 +504,28 @@ void taskInput(void *pvParameters) {
               if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
             } else if (ev.type == INPUT_ENC_CLICK) {
               switch (menuMainSelection) {
-                case 0: // Gallery
+                case 0: // Gallery — requires SD
+                  if (!globalSDState.isMounted) {
+                    showTFTMessage("SD REQUIRED!", TFT_RED, 1500);
+                    galleryNeedsRedraw = true;
+                    if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                    break;
+                  }
                   galleryTypeSelection = 0;
                   galleryNeedsRedraw = true;
                   appState = STATE_GALLERY_TYPE;
                   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                   break;
-                case 1: // WiFi
+                case 1: // WiFi — requires SD
+                  if (!globalSDState.isMounted) {
+                    showTFTMessage("SD REQUIRED!", TFT_RED, 1500);
+                    galleryNeedsRedraw = true;
+                    if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                    break;
+                  }
                   startWiFiMode();
                   break;
-                case 2: // Settings
+                case 2: // Settings — no SD needed
                   settingsIndex = 0;
                   settingsEditing = false;
                   galleryNeedsRedraw = true;
@@ -1056,14 +742,11 @@ void taskInput(void *pvParameters) {
                   // Confirm edit — save to NVS immediately
                   settingsEditing = false;
                   saveCameraSettings();
-                  // Update runtime mirror if hmirror changed
-                  if (settingsIndex == 6) mirror = camSettings.hmirror;
                   galleryNeedsRedraw = true;
                   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                 } else if (ev.type == INPUT_ENC_LONG) {
                   // Cancel edit — revert to saved
                   loadCameraSettings();
-                  mirror = camSettings.hmirror;
                   settingsEditing = false;
                   galleryNeedsRedraw = true;
                   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
@@ -1080,7 +763,6 @@ void taskInput(void *pvParameters) {
     }
 
     lastShutter = shutterNow;
-    lastBoot    = bootNow;
 
 #if DEBUG_INPUT
     // Print ISR-generated encoder events (not routed through sendEvent).
@@ -1101,7 +783,7 @@ void taskInput(void *pvParameters) {
 // Placed in IRAM so they execute even during Flash cache misses (e.g. SD writes).
 // Both ISRs push directly to inputEventQueue — the same queue taskInput uses —
 // so all menu logic consumes from a single source.
-void IRAM_ATTR encoderISR() {
+static void IRAM_ATTR encoderISR() {
   // Read current 2-bit state: (CLK << 1) | DT
   uint8_t s = ((uint8_t)digitalRead(ENC_CLK) << 1) | (uint8_t)digitalRead(ENC_DT);
 
@@ -1137,7 +819,7 @@ void IRAM_ATTR encoderISR() {
   }
 }
 
-void IRAM_ATTR encSwISR() {
+static void IRAM_ATTR encSwISR() {
   uint32_t now = millis();
   if (digitalRead(ENC_SW) == LOW) {
     // Falling edge — record press start time.
@@ -1159,7 +841,7 @@ void IRAM_ATTR encSwISR() {
 }
 
 // ================= TASK: CAMERA CAPTURE (Core 1, Priority 6) =================
-void taskCapture(void *pvParameters) {
+static void taskCapture(void *pvParameters) {
   int fail_count = 0;
 
   while (true) {
@@ -1339,7 +1021,7 @@ void taskCapture(void *pvParameters) {
 }
 
 // ================= TASK: TFT DISPLAY (Core 1, Priority 3) =================
-void taskDisplay(void *pvParameters) {
+static void taskDisplay(void *pvParameters) {
   uint32_t last_fps_time = 0;
   uint32_t frame_count = 0;
   float fps = 0;
@@ -1434,7 +1116,6 @@ void taskDisplay(void *pvParameters) {
 
 // Draws the persistent bottom status bar (FPS + version + SD indicator).
 // Called from taskDisplay whenever the 1-second FPS window elapses.
-// Extracted to keep taskDisplay readable and to make version updates trivial.
 static void drawStatusBar(float fps) {
   if (!xSemaphoreTake(spiMutex, pdMS_TO_TICKS(10))) return;
 
@@ -1462,7 +1143,7 @@ static void drawStatusBar(float fps) {
 }
 
 // ================= TASK: AVI RECORDER (Core 0, Priority 4) =================
-void taskRecorder(void *pvParameters) {
+static void taskRecorder(void *pvParameters) {
   while (true) {
     if (appState != STATE_RECORDING && appState != STATE_STOPPING) {
       vTaskDelay(pdMS_TO_TICKS(50));
@@ -1472,10 +1153,6 @@ void taskRecorder(void *pvParameters) {
     RecFrame rf;
     if (xQueueReceive(recFrameQueue, &rf, pdMS_TO_TICKS(100)) == pdTRUE) {
       // Read exactly one frame's worth of audio from the I2S DMA ring buffer.
-      // Because dma_frame_num=160 gives 320-byte DMA slots, AUDIO_BYTES_PER_FRAME
-      // (3200) drains in exactly 10 slots — i.e. one slot per 10 ms of audio.
-      // Zero-pad any shortage so every video frame gets a fixed-size audio chunk;
-      // this keeps total audio sample count predictable and prevents AV drift.
       size_t audio_bytes_read = 0;
       if (i2s_rx_handle && audioRecBuf) {
         i2s_channel_read(i2s_rx_handle, audioRecBuf, AUDIO_BYTES_PER_FRAME,
@@ -1487,13 +1164,9 @@ void taskRecorder(void *pvParameters) {
         }
       }
 
-      // portMAX_DELAY: never silently drop a frame. If SD is slow, backpressure
-      // naturally propagates via recPoolFree semaphore to throttle capture.
       if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
         if (videoFile) {
           bool ok = writeAVIFrameFromBuf(videoFile, recPool[rf.idx], rf.len);
-          // Always write audio chunk — consistent chunk per frame is required for
-          // correct sync. Missing chunks cause cumulative drift; silence is better.
           if (ok && audio_bytes_read > 0) {
             writeAVIAudioChunk(videoFile, (uint8_t*)audioRecBuf, audio_bytes_read);
           }
@@ -1515,10 +1188,8 @@ void taskRecorder(void *pvParameters) {
   }
 }
 
-
-
 // ================= PHOTO CAPTURE =================
-void savePhotoHighRes() {
+static void savePhotoHighRes() {
   appState = STATE_PHOTO;
 
   // Show "HOLD ON..." — taskDisplay skips rendering during STATE_PHOTO
@@ -1656,476 +1327,13 @@ void initCamera(pixformat_t format, framesize_t size, int jpeg_quality) {
   delay(100);
 }
 
-// ================= CAMERA SETTINGS NVS =================
-void loadCameraSettings() {
-  Preferences p;
-  p.begin("cam", true);  // read-only
-  camSettings.brightness    = p.getInt("bright", 1);
-  camSettings.contrast      = p.getInt("contr",  0);
-  camSettings.saturation    = p.getInt("sat",    2);
-  camSettings.ae_level      = p.getInt("ae",     0);
-  camSettings.wb_mode       = p.getInt("wb",     0);
-  camSettings.special_effect = p.getInt("fx",    0);
-  camSettings.hmirror       = p.getInt("hmirr",  1);
-  camSettings.vflip         = p.getInt("vflip",  0);
-  camSettings.jpeg_quality  = p.getInt("jpgq",  12);
-  p.end();
-  Serial.println("[NVS] Camera settings loaded.");
-}
-
-void saveCameraSettings() {
-  Preferences p;
-  p.begin("cam", false);  // read-write
-  p.putInt("bright", camSettings.brightness);
-  p.putInt("contr",  camSettings.contrast);
-  p.putInt("sat",    camSettings.saturation);
-  p.putInt("ae",     camSettings.ae_level);
-  p.putInt("wb",     camSettings.wb_mode);
-  p.putInt("fx",     camSettings.special_effect);
-  p.putInt("hmirr",  camSettings.hmirror);
-  p.putInt("vflip",  camSettings.vflip);
-  p.putInt("jpgq",   camSettings.jpeg_quality);
-  p.end();
-  Serial.println("[NVS] Camera settings saved.");
-}
-
-// Applies CameraSettings to the active sensor. Called after every initCamera.
-void applySettings(sensor_t *s) {
-  if (!s) return;
-  s->set_brightness(s, camSettings.brightness);
-  s->set_contrast(s, camSettings.contrast);
-  s->set_saturation(s, camSettings.saturation);
-  s->set_ae_level(s, camSettings.ae_level);
-  s->set_wb_mode(s, camSettings.wb_mode);
-  s->set_special_effect(s, camSettings.special_effect);
-  s->set_hmirror(s, mirror);  // runtime mirror (toggled by BOOT button)
-  s->set_vflip(s, camSettings.vflip);
-}
-
-// ================= WIFI FILE SERVER =================
-// Embedded HTML — mobile-first dark theme file manager with tabbed photo/video views.
-// Served from PROGMEM to avoid PSRAM/heap allocation for static content.
-static const char INDEX_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Retro Cam</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:#111;color:#e0e0e0;padding:16px;max-width:600px;margin:0 auto}
-h1{font-size:1.4em;margin-bottom:12px;color:#fff}
-.bar{background:#222;border-radius:8px;overflow:hidden;height:24px;margin-bottom:12px;position:relative}
-.bar-fill{height:100%;background:linear-gradient(90deg,#2ecc71,#27ae60);transition:width .3s}
-.bar-text{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:.8em;color:#fff;white-space:nowrap}
-.tabs{display:flex;gap:8px;margin-bottom:12px}
-.tab{flex:1;padding:10px;border:none;border-radius:8px;cursor:pointer;font-size:.9em;font-weight:600;background:#222;color:#888;text-align:center;transition:all .2s}
-.tab.active{background:#2980b9;color:#fff}
-.tab .badge{display:inline-block;background:rgba(0,0,0,.3);border-radius:10px;padding:1px 7px;font-size:.75em;margin-left:4px}
-.file{display:flex;align-items:center;background:#1a1a1a;border-radius:8px;padding:10px 12px;margin-bottom:8px;border:1px solid #2a2a2a}
-.thumb{width:80px;height:45px;border-radius:4px;object-fit:cover;flex-shrink:0;background:#222}
-.file-info{flex:1;min-width:0;margin-left:10px}
-.file-name{font-size:.9em;word-break:break-all;color:#fff}
-.file-size{font-size:.75em;color:#888;margin-top:2px}
-.btns{display:flex;gap:6px;margin-left:8px;flex-shrink:0}
-.btn{border:none;padding:8px 12px;border-radius:6px;cursor:pointer;font-size:.8em;font-weight:600;text-decoration:none;text-align:center}
-.btn-dl{background:#2980b9;color:#fff}
-.btn-del{background:#c0392b;color:#fff}
-.btn:active{opacity:.7}
-.empty{text-align:center;color:#666;padding:40px 0}
-.err{text-align:center;color:#e74c3c;padding:30px 0;font-size:.9em}
-.modal-bg{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:10;align-items:center;justify-content:center}
-.modal-bg.show{display:flex}
-.modal{background:#222;border-radius:12px;padding:24px;max-width:320px;width:90%;text-align:center}
-.modal p{margin-bottom:16px;font-size:.95em}
-.modal .btns{justify-content:center}
-#status{text-align:center;color:#2ecc71;font-size:.85em;margin-bottom:12px;min-height:1.2em}
-</style>
-</head>
-<body>
-<h1>&#128247; Retro Cam Files</h1>
-<div id="status"></div>
-<div class="bar"><div class="bar-fill" id="barFill"></div><div class="bar-text" id="barText">Loading...</div></div>
-<div class="tabs">
- <button class="tab active" id="tabPhotos" onclick="switchTab('photos')">&#128248; Photos <span class="badge" id="cntPhotos">0</span></button>
- <button class="tab" id="tabVideos" onclick="switchTab('videos')">&#127916; Videos <span class="badge" id="cntVideos">0</span></button>
-</div>
-<div id="list"><div class="empty">Loading...</div></div>
-<div class="modal-bg" id="modalBg"><div class="modal"><p id="modalMsg">Delete?</p><div class="btns"><button class="btn btn-dl" onclick="closeModal()">Cancel</button><button class="btn btn-del" id="modalDel">Delete</button></div></div></div>
-<script>
-let delTarget='',allFiles=[],curTab='photos';
-function switchTab(t){
- curTab=t;
- document.getElementById('tabPhotos').className='tab'+(t==='photos'?' active':'');
- document.getElementById('tabVideos').className='tab'+(t==='videos'?' active':'');
- renderFiles();
-}
-function renderFiles(){
- let el=document.getElementById('list');
- let filtered=allFiles.filter(f=>curTab==='videos'?f.isVideo:!f.isVideo);
- filtered.sort((a,b)=>a.name.localeCompare(b.name));
- if(!filtered.length){el.innerHTML='<div class="empty">No '+(curTab==='videos'?'videos':'photos')+' on SD card</div>';return;}
- let h='';
- filtered.forEach(f=>{
-  let sz=f.size<1048576?(f.size/1024).toFixed(1)+' KB':(f.size/1048576).toFixed(1)+' MB';
-  h+='<div class="file">';
-  h+='<img class="thumb" loading="lazy" src="/api/preview?file='+encodeURIComponent(f.name)+'" alt="">';
-  h+='<div class="file-info"><div class="file-name">'+f.name+'</div><div class="file-size">'+sz+'</div></div><div class="btns">';
-  h+='<a class="btn btn-dl" download href="/api/download?file='+encodeURIComponent(f.name)+'">&#11015;</a>';
-  h+='<button class="btn btn-del" onclick="confirmDel(\''+f.name.replace(/'/g,"\\'")+'\')">\&#128465;</button>';
-  h+='</div></div>';
- });
- el.innerHTML=h;
-}
-function load(){
- fetch('/api/info').then(r=>r.json()).then(d=>{
-  if(d.error){document.getElementById('barText').textContent='SD card unavailable';return;}
-  let pct=((d.used/d.total)*100).toFixed(1);
-  document.getElementById('barFill').style.width=pct+'%';
-  let fmt=b=>(b/1048576).toFixed(1)+' MB';
-  document.getElementById('barText').textContent=fmt(d.used)+' / '+fmt(d.total)+' ('+fmt(d.free)+' free)';
- }).catch(()=>{document.getElementById('barText').textContent='Connection error';});
- fetch('/api/files').then(r=>r.json()).then(files=>{
-  if(files.error){document.getElementById('list').innerHTML='<div class="err">'+files.error+'</div>';return;}
-  allFiles=files;
-  let photos=files.filter(f=>!f.isVideo).length;
-  let videos=files.filter(f=>f.isVideo).length;
-  document.getElementById('cntPhotos').textContent=photos;
-  document.getElementById('cntVideos').textContent=videos;
-  renderFiles();
- }).catch(()=>{document.getElementById('list').innerHTML='<div class="err">Connection error</div>';});
-}
-function confirmDel(name){delTarget=name;document.getElementById('modalMsg').textContent='Delete '+name+'?';document.getElementById('modalBg').classList.add('show');}
-function closeModal(){document.getElementById('modalBg').classList.remove('show');delTarget='';}
-document.getElementById('modalDel').onclick=function(){
- if(!delTarget)return;
- let s=document.getElementById('status');
- s.textContent='Deleting...';s.style.color='#e67e22';
- fetch('/api/delete?file='+encodeURIComponent(delTarget)).then(r=>r.json()).then(d=>{
-  closeModal();
-  s.textContent=d.ok?'Deleted!':'Error: '+d.msg;
-  s.style.color=d.ok?'#2ecc71':'#c0392b';
-  setTimeout(()=>{s.textContent='';load();},1200);
- });
-};
-load();
-</script>
-</body>
-</html>
-)rawliteral";
-
-// Start WiFi AP mode: deinit camera, start softAP + web server, show TFT info.
-void startWiFiMode() {
-  if (appState == STATE_WIFI_MODE) return;
-
-  Serial.println("[WIFI] Entering WiFi mode...");
-
-  // Tell other tasks to stop using camera & TFT immediately
-  appState = STATE_WIFI_MODE;
-  vTaskDelay(pdMS_TO_TICKS(150));
-
-  // Deinit camera — frees PSRAM for WiFi stack
-  esp_camera_deinit();
-
-  // Start WiFi AP
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(WIFI_SSID, WIFI_PASS);
-  delay(100);
-  IPAddress ip = WiFi.softAPIP();
-  Serial.printf("[WIFI] AP started: %s / %s\n", WIFI_SSID, ip.toString().c_str());
-
-  // Allocate and configure web server
-  webServer = new AsyncWebServer(80);
-
-  // Route: main page
-  webServer->on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "text/html", INDEX_HTML);
-  });
-
-  // Route: SD info JSON — validates SD mount before access
-  webServer->on("/api/info", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!globalSDState.isMounted) {
-      request->send(200, "application/json", "{\"error\":\"SD card not mounted\",\"total\":0,\"used\":0,\"free\":0}");
-      return;
-    }
-    uint64_t total = 0, used = 0;
-    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-      total = SD.totalBytes();
-      used  = SD.usedBytes();
-      xSemaphoreGive(spiMutex);
-    }
-    char buf[128];
-    snprintf(buf, sizeof(buf),
-             "{\"total\":%llu,\"used\":%llu,\"free\":%llu}",
-             total, used, total - used);
-    request->send(200, "application/json", buf);
-  });
-
-  // Route: file list JSON — validates SD mount before scan
-  webServer->on("/api/files", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!globalSDState.isMounted) {
-      request->send(200, "application/json", "{\"error\":\"SD card not mounted\"}");
-      return;
-    }
-    String json = "[";
-    bool first = true;
-    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-      File root = SD.open("/");
-      if (root) {
-        File f = root.openNextFile();
-        while (f) {
-          if (!f.isDirectory()) {
-            String name = f.name();
-            // Only list .jpg and .avi files
-            if (name.endsWith(".jpg") || name.endsWith(".avi")) {
-              if (!first) json += ",";
-              first = false;
-              json += "{\"name\":\"";
-              json += name;
-              json += "\",\"size\":";
-              json += String((unsigned long)f.size());
-              json += ",\"isVideo\":";
-              json += name.endsWith(".avi") ? "true" : "false";
-              json += "}";
-            }
-          }
-          f = root.openNextFile();
-        }
-        root.close();
-      }
-      xSemaphoreGive(spiMutex);
-    }
-    json += "]";
-    request->send(200, "application/json", json);
-  });
-
-  // Route: download file (chunked stream, forced download via HTML download attr)
-  // Uses shared_ptr<File> so the file is auto-closed if client disconnects mid-transfer.
-  webServer->on("/api/download", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!request->hasParam("file")) {
-      request->send(400, "text/plain", "Missing file param");
-      return;
-    }
-    if (!globalSDState.isMounted) {
-      request->send(503, "text/plain", "SD card not mounted");
-      return;
-    }
-    String filename = request->getParam("file")->value();
-    if (!filename.startsWith("/")) filename = "/" + filename;
-
-    // Open file with mutex — shared_ptr ensures RAII cleanup
-    auto fp = std::make_shared<File>();
-    bool opened = false;
-    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-      *fp = SD.open(filename, FILE_READ);
-      opened = (bool)*fp;
-      xSemaphoreGive(spiMutex);
-    }
-    if (!opened) {
-      request->send(404, "text/plain", "File not found");
-      return;
-    }
-
-    String contentType = filename.endsWith(".jpg") ? "image/jpeg" : "application/octet-stream";
-
-    AsyncWebServerResponse *response = request->beginChunkedResponse(
-      contentType.c_str(),
-      [fp](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-        if (!*fp) return 0;
-        size_t bytesRead = 0;
-        if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-          bytesRead = fp->read(buffer, maxLen);
-          if (bytesRead == 0) {
-            fp->close();
-          }
-          xSemaphoreGive(spiMutex);
-        }
-        return bytesRead;
-      }
-    );
-    request->send(response);
-  });
-
-  // Route: preview file inline (for thumbnail <img> tags — no Content-Disposition)
-  // For .jpg files: streams the full file as before.
-  // For .avi files: extracts frame 12 JPEG from MOVI list and sends it.
-  webServer->on("/api/preview", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!request->hasParam("file")) {
-      request->send(400, "text/plain", "Missing file param");
-      return;
-    }
-    if (!globalSDState.isMounted) {
-      request->send(503, "text/plain", "SD not mounted");
-      return;
-    }
-    String filename = request->getParam("file")->value();
-    if (!filename.startsWith("/")) filename = "/" + filename;
-
-    bool isAvi = filename.endsWith(".avi");
-
-    if (isAvi) {
-      // AVI video thumbnail: extract a single JPEG frame into PSRAM, send it.
-      // We use a temporary ps_malloc buffer because the async callback would need
-      // the file open across multiple chunks — but we want to extract and close.
-      uint8_t *thumbBuf = (uint8_t*)ps_malloc(REC_BUF_SIZE);
-      if (!thumbBuf) {
-        request->send(500, "text/plain", "PSRAM alloc failed");
-        return;
-      }
-      size_t thumbLen = 0;
-      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-        File aviFile = SD.open(filename, FILE_READ);
-        if (aviFile) {
-          thumbLen = extractAVIFrame(aviFile, thumbBuf, REC_BUF_SIZE, 12);
-          aviFile.close();
-        }
-        xSemaphoreGive(spiMutex);
-      }
-      if (thumbLen == 0) {
-        free(thumbBuf);
-        request->send(404, "text/plain", "No frame found");
-        return;
-      }
-      // Wrap buffer in shared_ptr for automatic cleanup after response
-      auto bufPtr = std::shared_ptr<uint8_t>(thumbBuf, free);
-      size_t totalLen = thumbLen;
-      AsyncWebServerResponse *response = request->beginChunkedResponse(
-        "image/jpeg",
-        [bufPtr, totalLen](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-          if (index >= totalLen) return 0;
-          size_t remain = totalLen - index;
-          size_t toSend = (remain < maxLen) ? remain : maxLen;
-          memcpy(buffer, bufPtr.get() + index, toSend);
-          return toSend;
-        }
-      );
-      response->addHeader("Cache-Control", "max-age=300");
-      request->send(response);
-    } else {
-      // JPEG photo: stream directly from file
-      auto fp = std::make_shared<File>();
-      bool opened = false;
-      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-        *fp = SD.open(filename, FILE_READ);
-        opened = (bool)*fp;
-        xSemaphoreGive(spiMutex);
-      }
-      if (!opened) {
-        request->send(404, "text/plain", "Not found");
-        return;
-      }
-
-      AsyncWebServerResponse *response = request->beginChunkedResponse(
-        "image/jpeg",
-        [fp](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-          if (!*fp) return 0;
-          size_t bytesRead = 0;
-          if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-            bytesRead = fp->read(buffer, maxLen);
-            if (bytesRead == 0) {
-              fp->close();
-            }
-            xSemaphoreGive(spiMutex);
-          }
-          return bytesRead;
-        }
-      );
-      // Cache thumbnails in browser for 5 min — avoid re-downloading on page reload
-      response->addHeader("Cache-Control", "max-age=300");
-      request->send(response);
-    }
-  });
-
-  // Route: delete file — validates SD mount
-  webServer->on("/api/delete", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!request->hasParam("file")) {
-      request->send(400, "application/json", "{\"ok\":false,\"msg\":\"Missing file param\"}");
-      return;
-    }
-    if (!globalSDState.isMounted) {
-      request->send(200, "application/json", "{\"ok\":false,\"msg\":\"SD card not mounted\"}");
-      return;
-    }
-    String filename = request->getParam("file")->value();
-    if (!filename.startsWith("/")) filename = "/" + filename;
-
-    bool ok = false;
-    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-      ok = SD.remove(filename);
-      xSemaphoreGive(spiMutex);
-    }
-    if (ok) {
-      request->send(200, "application/json", "{\"ok\":true}");
-      Serial.printf("[WIFI] Deleted: %s\n", filename.c_str());
-    } else {
-      request->send(200, "application/json", "{\"ok\":false,\"msg\":\"Delete failed\"}");
-    }
-  });
-
-  webServer->begin();
-  Serial.println("[WIFI] Web server started on port 80.");
-
-  // Draw info screen on TFT
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextDatum(middle_center);
-    tft.setTextColor(TFT_CYAN);
-    tft.setTextSize(2);
-    tft.drawString("WiFi Active", tft.width() / 2, 50);
-    tft.setTextColor(TFT_WHITE);
-    tft.setTextSize(2);
-    tft.drawString("SSID:", tft.width() / 2, 95);
-    tft.setTextColor(TFT_GREEN);
-    tft.drawString(WIFI_SSID, tft.width() / 2, 120);
-    tft.setTextColor(TFT_WHITE);
-    tft.drawString("IP:", tft.width() / 2, 155);
-    tft.setTextColor(TFT_YELLOW);
-    tft.drawString(ip.toString().c_str(), tft.width() / 2, 180);
-    tft.setTextColor(0x7BEF);  // dim grey
-    tft.setTextSize(1);
-    tft.drawString("Press to exit", tft.width() / 2, 220);
-    tft.setTextDatum(top_left);
-    xSemaphoreGive(spiMutex);
-  }
-}
-
-// Stop WiFi mode: tear down server + AP, reinit camera, return to IDLE.
-void stopWiFiMode() {
-  if (appState != STATE_WIFI_MODE) return;
-
-  Serial.println("[WIFI] Exiting WiFi mode...");
-
-  if (webServer) {
-    webServer->end();
-    delete webServer;
-    webServer = nullptr;
-  }
-
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_OFF);
-  Serial.println("[WIFI] AP stopped.");
-
-  // Reinit camera
-  initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
-
-  // Clear TFT
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    tft.fillScreen(TFT_BLACK);
-    xSemaphoreGive(spiMutex);
-  }
-
-  appState = STATE_IDLE;
-  Serial.println("[WIFI] Back to IDLE.");
-}
-
 // ================= MICROPHONE =================
 void initMicrophone() {
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   // DMA geometry tuned for exact per-frame audio drain:
-  //   dma_frame_num=160 → 160 × 2 bytes = 320 bytes per DMA slot (fills in 10 ms)
-  //   AUDIO_BYTES_PER_FRAME (3200) / 320 = 10 slots → drains in exact multiples
-  //   dma_desc_num=16   → 16 × 320 = 5120 bytes total buffer ≈ 160 ms capacity
+  //   dma_frame_num=160 -> 160 x 2 bytes = 320 bytes per DMA slot (fills in 10 ms)
+  //   AUDIO_BYTES_PER_FRAME (3200) / 320 = 10 slots -> drains in exact multiples
+  //   dma_desc_num=16   -> 16 x 320 = 5120 bytes total buffer = 160 ms capacity
   chan_cfg.dma_desc_num  = 16;
   chan_cfg.dma_frame_num = 160;
   chan_cfg.auto_clear    = true;
@@ -2166,284 +1374,6 @@ void deinitMicrophone() {
   }
 }
 
-// ================= AVI WRITER =================
-void startAVI(File &file, int fps, int width, int height) {
-  avi_movi_size = 0;
-  avi_total_frames = 0;
-  avi_total_audio_chunks = 0;
-  avi_total_chunks = 0;
-  avi_start_time = millis();
-
-  // Arrays are pre-allocated at boot — just zero them to clear stale data from last session.
-  // This avoids PSRAM malloc/free cycles that cause heap fragmentation over multiple recordings.
-  if (avi_frame_sizes) memset(avi_frame_sizes, 0, MAX_AVI_FRAMES * sizeof(uint32_t));
-  if (avi_audio_sizes) memset(avi_audio_sizes, 0, MAX_AVI_FRAMES * sizeof(uint32_t));
-  if (avi_chunk_order) memset(avi_chunk_order, 0, MAX_AVI_CHUNKS);
-
-  uint8_t zero_buf[avi_header_size];
-  memset(zero_buf, 0, avi_header_size);
-  file.write(zero_buf, avi_header_size);
-}
-
-bool writeAVIFrameFromBuf(File &file, uint8_t *buf, size_t len) {
-  uint8_t dc_buf[4] = {0x30, 0x30, 0x64, 0x63}; // "00dc"
-  size_t w1 = file.write(dc_buf, 4);
-
-  uint32_t rem = len % 4;
-  uint32_t padding = (rem == 0) ? 0 : 4 - rem;
-  uint32_t totalLen = len + padding;
-
-  size_t w2 = file.write((uint8_t*)&totalLen, 4);
-  size_t w3 = file.write(buf, len);
-
-  if (padding > 0) {
-    uint8_t pad[3] = {0, 0, 0};
-    file.write(pad, padding);
-  }
-
-  if (w1 != 4 || w2 != 4 || w3 != len) {
-    return false;
-  }
-
-  avi_movi_size += (totalLen + 8);
-  if (avi_frame_sizes && avi_total_frames < avi_frame_capacity) {
-    avi_frame_sizes[avi_total_frames] = totalLen;
-  }
-  avi_total_frames++;
-  if (avi_chunk_order && avi_total_chunks < avi_frame_capacity * 2) {
-    avi_chunk_order[avi_total_chunks++] = 0;
-  }
-  return true;
-}
-
-bool writeAVIAudioChunk(File &file, uint8_t *buf, size_t bytes) {
-  uint8_t wb_tag[4] = {0x30, 0x31, 0x77, 0x62}; // "01wb"
-  size_t w1 = file.write(wb_tag, 4);
-
-  uint32_t len = bytes;
-  uint32_t rem = len % 4;
-  uint32_t pad = (rem == 0) ? 0 : 4 - rem;
-  uint32_t totalLen = len + pad;
-
-  size_t w2 = file.write((uint8_t*)&totalLen, 4);
-  size_t w3 = file.write(buf, bytes);
-
-  if (pad > 0) {
-    uint8_t zeros[3] = {0, 0, 0};
-    file.write(zeros, pad);
-  }
-
-  if (w1 != 4 || w2 != 4 || w3 != bytes) return false;
-
-  avi_movi_size += (totalLen + 8);
-  if (avi_audio_sizes && avi_total_audio_chunks < avi_frame_capacity) {
-    avi_audio_sizes[avi_total_audio_chunks] = totalLen;
-  }
-  avi_total_audio_chunks++;
-  if (avi_chunk_order && avi_total_chunks < avi_frame_capacity * 2) {
-    avi_chunk_order[avi_total_chunks++] = 1;
-  }
-  return true;
-}
-
-void endAVI(File &file, int fps, int width, int height) {
-  // Defensive guard: if SD was removed mid-recording, the file handle is invalid.
-  // Attempting to seek/write would crash or corrupt memory. Bail out gracefully.
-  if (!file) {
-    Serial.println("[REC] endAVI: file handle invalid (SD removed?), skipping finalization.");
-    return;
-  }
-
-  unsigned long duration = millis() - avi_start_time;
-  float real_fps = (float)avi_total_frames / (duration / 1000.0f);
-  if (real_fps <= 0) real_fps = (float)TARGET_FPS;
-  Serial.printf("[REC] Actual FPS: %.2f, frames: %d, audio chunks: %d\n",
-                real_fps, avi_total_frames, avi_total_audio_chunks);
-
-  // Use the declared TARGET_FPS for the AVI header rather than the measured average.
-  // The measured average is skewed by the camera warm-up period and variable SD
-  // write latency; a stable constant gives AVI players a reliable timing baseline.
-  uint32_t microSecPerFrame = 1000000UL / TARGET_FPS;
-
-  // Each audio chunk is exactly AUDIO_BYTES_PER_FRAME bytes (zero-padded when
-  // needed), so total samples is exactly chunks × samples-per-chunk.
-  uint32_t total_audio_samples = (uint32_t)avi_total_audio_chunks * AUDIO_SAMPLES_PER_FRAME;
-
-  // step 1: write idx1 at end of file
-  file.seek(0, SeekEnd);
-  file.write((const uint8_t*)"idx1", 4);
-  int total_idx_entries = avi_total_chunks;
-  uint32_t idx1Size = total_idx_entries * 16;
-  file.write((uint8_t*)&idx1Size, 4);
-
-  // Build idx1 in actual chunk write order (not assumed V-A interleaving)
-  uint32_t chunkOffset = 4;
-  int vi = 0, ai = 0;
-  for (int i = 0; i < avi_total_chunks; i++) {
-    if (avi_chunk_order && avi_chunk_order[i] == 0) {
-      uint32_t fSize = (avi_frame_sizes && vi < avi_frame_capacity) ? avi_frame_sizes[vi] : 0;
-      file.write((const uint8_t*)"00dc", 4);
-      uint32_t kf = 0x10;  // AVIIF_KEYFRAME
-      file.write((uint8_t*)&kf, 4);
-      file.write((uint8_t*)&chunkOffset, 4);
-      file.write((uint8_t*)&fSize, 4);
-      chunkOffset += fSize + 8;
-      vi++;
-    } else {
-      uint32_t aSize = (avi_audio_sizes && ai < avi_frame_capacity) ? avi_audio_sizes[ai] : 0;
-      file.write((const uint8_t*)"01wb", 4);
-      uint32_t noKf = 0x00;
-      file.write((uint8_t*)&noKf, 4);
-      file.write((uint8_t*)&chunkOffset, 4);
-      file.write((uint8_t*)&aSize, 4);
-      chunkOffset += aSize + 8;
-      ai++;
-    }
-  }
-
-  // step 2: capture exact file position right after idx1 — file.size() may return
-  // stale data before FAT commits, which caused riffSize = 0xFFFFFFF8 in MediaInfo.
-  uint32_t totalSize = (uint32_t)file.position();
-  uint32_t riffSize  = totalSize - 8;
-
-  file.seek(0);
-  // microSecPerFrame is derived from TARGET_FPS (set in endAVI preamble), not real_fps.
-  uint32_t microSecPerFrame_hdr = 1000000UL / TARGET_FPS;
-  uint32_t maxBytesPerSec = (uint32_t)((width * height * 2) * TARGET_FPS) + AUDIO_SAMPLE_RATE * 2;
-
-  file.write((const uint8_t*)"RIFF", 4);
-  file.write((uint8_t*)&riffSize, 4);
-  file.write((const uint8_t*)"AVI ", 4);
-
-  file.write((const uint8_t*)"LIST", 4);
-  uint32_t hdrlSize = 292;
-  file.write((uint8_t*)&hdrlSize, 4);
-  file.write((const uint8_t*)"hdrl", 4);
-
-  file.write((const uint8_t*)"avih", 4);
-  uint32_t avihSize = 56;
-  file.write((uint8_t*)&avihSize, 4);
-
-  file.write((uint8_t*)&microSecPerFrame_hdr, 4);
-  file.write((uint8_t*)&maxBytesPerSec, 4);
-  uint32_t padding = 0;
-  file.write((uint8_t*)&padding, 4);
-  uint32_t avih_flags = 0x10;  // AVIF_HASINDEX
-  file.write((uint8_t*)&avih_flags, 4);
-  file.write((uint8_t*)&avi_total_frames, 4);
-  file.write((uint8_t*)&padding, 4);
-  uint32_t streams = 2;  // video + audio
-  file.write((uint8_t*)&streams, 4);
-  uint32_t bufSize = width * height * 2;
-  file.write((uint8_t*)&bufSize, 4);
-  file.write((uint8_t*)&width, 4);
-  file.write((uint8_t*)&height, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-
-  file.write((const uint8_t*)"LIST", 4);
-  uint32_t strlSize = 116;
-  file.write((uint8_t*)&strlSize, 4);
-  file.write((const uint8_t*)"strl", 4);
-
-  file.write((const uint8_t*)"strh", 4);
-  uint32_t strhSize = 56;
-  file.write((uint8_t*)&strhSize, 4);
-  file.write((const uint8_t*)"vids", 4);
-  file.write((const uint8_t*)"MJPG", 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-  uint32_t scale = 1;
-  file.write((uint8_t*)&scale, 4);
-  uint32_t rate = TARGET_FPS;
-  if (rate == 0) rate = 10;
-  file.write((uint8_t*)&rate, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&avi_total_frames, 4);
-  file.write((uint8_t*)&bufSize, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-
-  file.write((const uint8_t*)"strf", 4);
-  uint32_t strfSize = 40;
-  file.write((uint8_t*)&strfSize, 4);
-  file.write((uint8_t*)&strfSize, 4);
-  file.write((uint8_t*)&width, 4);
-  file.write((uint8_t*)&height, 4);
-  uint16_t planes = 1;
-  file.write((uint8_t*)&planes, 2);
-  uint16_t bitCount = 24;
-  file.write((uint8_t*)&bitCount, 2);
-  file.write((const uint8_t*)"MJPG", 4);
-  uint32_t imageSize = width * height * 3;
-  file.write((uint8_t*)&imageSize, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-
-  // audio stream LIST (strl)
-  file.write((const uint8_t*)"LIST", 4);
-  uint32_t strlSize_aud = 92;
-  file.write((uint8_t*)&strlSize_aud, 4);
-  file.write((const uint8_t*)"strl", 4);
-
-  // audio strh
-  file.write((const uint8_t*)"strh", 4);
-  file.write((uint8_t*)&strhSize, 4);
-  file.write((const uint8_t*)"auds", 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-  uint32_t audio_scale = 1;
-  file.write((uint8_t*)&audio_scale, 4);
-  uint32_t audio_rate = AUDIO_SAMPLE_RATE;
-  file.write((uint8_t*)&audio_rate, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&total_audio_samples, 4);
-  uint32_t audio_buf_suggest = AUDIO_SAMPLE_RATE * 2;
-  file.write((uint8_t*)&audio_buf_suggest, 4);
-  file.write((uint8_t*)&padding, 4);
-  uint32_t audio_sample_size = 2;
-  file.write((uint8_t*)&audio_sample_size, 4);
-  file.write((uint8_t*)&padding, 4);
-  file.write((uint8_t*)&padding, 4);
-
-  // audio strf (PCMWAVEFORMAT)
-  file.write((const uint8_t*)"strf", 4);
-  uint32_t strfSize_aud = 16;
-  file.write((uint8_t*)&strfSize_aud, 4);
-  uint16_t wFormatTag = 1;  // PCM
-  file.write((uint8_t*)&wFormatTag, 2);
-  uint16_t nChannels = 1;
-  file.write((uint8_t*)&nChannels, 2);
-  uint32_t nSamplesPerSec = AUDIO_SAMPLE_RATE;
-  file.write((uint8_t*)&nSamplesPerSec, 4);
-  uint32_t nAvgBytesPerSec = AUDIO_SAMPLE_RATE * 2;
-  file.write((uint8_t*)&nAvgBytesPerSec, 4);
-  uint16_t nBlockAlign = 2;
-  file.write((uint8_t*)&nBlockAlign, 2);
-  uint16_t wBitsPerSample = 16;
-  file.write((uint8_t*)&wBitsPerSample, 2);
-
-  // movi LIST header
-  file.write((const uint8_t*)"LIST", 4);
-  uint32_t moviListSize = 4 + avi_movi_size;
-  file.write((uint8_t*)&moviListSize, 4);
-  file.write((const uint8_t*)"movi", 4);
-
-  // AVI metadata arrays are intentionally kept alive (never freed).
-  // They are boot-allocated and reused across sessions via memset in startAVI().
-
-  file.close();
-}
-
 // ================= MENU HELPERS =================
 
 // Enter main menu from IDLE: deinit camera, set state, trigger redraw.
@@ -2469,686 +1399,4 @@ void exitMenuToIdle() {
     xSemaphoreGive(spiMutex);
   }
   appState = STATE_IDLE;
-}
-
-// Draw the main menu (Gallery / WiFi / Settings / Exit).
-void drawMenuMain() {
-  static const char* const labels[MENU_MAIN_ITEMS] = {
-    "Gallery", "WiFi Transfer", "Settings", "Exit"
-  };
-  // Accent colours per item for visual variety
-  static const uint16_t accents[MENU_MAIN_ITEMS] = {
-    TFT_CYAN, TFT_YELLOW, TFT_ORANGE, 0x7BEF  // cyan, yellow, orange, grey
-  };
-
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextDatum(middle_center);
-
-    // Title
-    tft.setTextSize(2);
-    tft.setTextColor(TFT_WHITE);
-    tft.drawString("MENU", tft.width() / 2, 22);
-
-    // Menu items
-    int yStart = 55;
-    int itemH = 38;
-    for (int i = 0; i < MENU_MAIN_ITEMS; i++) {
-      int y = yStart + i * itemH;
-      if (i == menuMainSelection) {
-        tft.fillRoundRect(50, y, 220, 32, 8, accents[i]);
-        tft.setTextSize(2);
-        tft.setTextColor(TFT_BLACK);
-      } else {
-        tft.drawRoundRect(50, y, 220, 32, 8, 0x4208);
-        tft.setTextSize(2);
-        tft.setTextColor(0x7BEF);
-      }
-      tft.drawString(labels[i], tft.width() / 2, y + 16);
-    }
-
-    // Footer hint
-    tft.setTextSize(1);
-    tft.setTextColor(0x4208);
-    tft.drawString("Click: Select  Long: Exit", tft.width() / 2, 225);
-
-    tft.setTextDatum(top_left);
-    xSemaphoreGive(spiMutex);
-  }
-}
-
-// Draw the camera settings menu.
-// Shows all 9 settings with current values; the highlighted item is shown
-// with inverted colours. In editing mode, the value flashes with a different
-// background to indicate it can be changed with CW/CCW.
-void drawSettingsMenu() {
-  // Human-readable labels matching CameraSettings struct field order
-  static const char* const names[SETTINGS_COUNT] = {
-    "Bright", "Contr", "Satur", "AE Lv",
-    "WB", "FX", "Mirror", "Flip", "JPEG Q"
-  };
-  // White balance mode labels
-  static const char* const wbLabels[] = {
-    "Auto", "Sunny", "Cloud", "Office", "Home"
-  };
-  // Special effect labels
-  static const char* const fxLabels[] = {
-    "None", "Neg", "Gray", "Red", "Green", "Blue", "Sepia"
-  };
-
-  // Read current values from camSettings into an array for uniform rendering
-  int vals[SETTINGS_COUNT] = {
-    camSettings.brightness, camSettings.contrast, camSettings.saturation,
-    camSettings.ae_level, camSettings.wb_mode, camSettings.special_effect,
-    camSettings.hmirror, camSettings.vflip, camSettings.jpeg_quality
-  };
-
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextDatum(middle_center);
-
-    // Title
-    tft.setTextSize(2);
-    tft.setTextColor(TFT_ORANGE);
-    tft.drawString("SETTINGS", tft.width() / 2, 14);
-
-    // Visible window: show up to 7 items at a time with scrolling
-    int visibleItems = 7;
-    int itemH = 25;
-    int yStart = 34;
-
-    // Calculate scroll window so the selected item stays visible
-    int scrollTop = 0;
-    if (settingsIndex >= visibleItems) {
-      scrollTop = settingsIndex - visibleItems + 1;
-    }
-
-    for (int v = 0; v < visibleItems && (scrollTop + v) < SETTINGS_COUNT; v++) {
-      int i = scrollTop + v;
-      int y = yStart + v * itemH;
-      bool selected = (i == settingsIndex);
-      bool editing = selected && settingsEditing;
-
-      // Background
-      if (editing) {
-        tft.fillRoundRect(4, y, 312, 22, 4, TFT_YELLOW);
-      } else if (selected) {
-        tft.fillRoundRect(4, y, 312, 22, 4, TFT_CYAN);
-      }
-
-      // Label (left)
-      tft.setTextDatum(middle_left);
-      tft.setTextSize(1);
-      tft.setTextColor((selected || editing) ? TFT_BLACK : TFT_WHITE);
-      tft.drawString(names[i], 10, y + 11);
-
-      // Value (right)
-      tft.setTextDatum(middle_right);
-      char valBuf[16];
-      if (i == 4) {
-        // WB mode — show label
-        snprintf(valBuf, sizeof(valBuf), "%s", wbLabels[constrain(vals[i], 0, 4)]);
-      } else if (i == 5) {
-        // FX — show label
-        snprintf(valBuf, sizeof(valBuf), "%s", fxLabels[constrain(vals[i], 0, 6)]);
-      } else if (i == 6 || i == 7) {
-        // Boolean — show On/Off
-        snprintf(valBuf, sizeof(valBuf), "%s", vals[i] ? "On" : "Off");
-      } else {
-        snprintf(valBuf, sizeof(valBuf), "%d", vals[i]);
-      }
-      tft.setTextColor((selected || editing) ? TFT_BLACK : TFT_GREEN);
-      tft.drawString(valBuf, 310, y + 11);
-    }
-
-    // Scroll indicators
-    tft.setTextDatum(middle_center);
-    tft.setTextSize(1);
-    tft.setTextColor(0x4208);
-    if (scrollTop > 0) {
-      tft.drawString("^", tft.width() / 2, yStart - 6);
-    }
-    if (scrollTop + visibleItems < SETTINGS_COUNT) {
-      tft.drawString("v", tft.width() / 2, yStart + visibleItems * itemH + 2);
-    }
-
-    // Footer hint
-    tft.setTextColor(0x4208);
-    if (settingsEditing) {
-      tft.drawString("Turn: Value  Click: OK  Long: Cancel", tft.width() / 2, 225);
-    } else {
-      tft.drawString("Turn: Browse  Click: Edit  Long: Back", tft.width() / 2, 225);
-    }
-
-    tft.setTextDatum(top_left);
-    xSemaphoreGive(spiMutex);
-  }
-}
-
-// ================= GALLERY FUNCTIONS =================
-
-// Scan SD root for .jpg or .avi files into PSRAM-backed array.
-// Call freeGalleryFiles() before re-scanning or exiting gallery.
-void scanGalleryFiles(bool videosOnly) {
-  freeGalleryFiles();
-  if (!globalSDState.isMounted) return;
-
-  const char *ext = videosOnly ? ".avi" : ".jpg";
-
-  // Allocate pointer array in PSRAM (2000 * 4 = 8KB — negligible)
-  galleryFiles = (char**)ps_malloc(GALLERY_MAX_FILES * sizeof(char*));
-  if (!galleryFiles) {
-    Serial.println("[GAL] PSRAM alloc failed for file index");
-    return;
-  }
-
-  int count = 0;
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    File root = SD.open("/");
-    if (root) {
-      File f = root.openNextFile();
-      while (f && count < GALLERY_MAX_FILES) {
-        if (!f.isDirectory()) {
-          String name = f.name();
-          if (name.endsWith(ext)) {
-            galleryFiles[count] = (char*)ps_malloc(GALLERY_NAME_LEN);
-            if (galleryFiles[count]) {
-              // f.name() may or may not include leading '/' depending on
-              // ESP32 Arduino core version. Normalize to always have '/'.
-              if (name.startsWith("/")) {
-                strncpy(galleryFiles[count], name.c_str(), GALLERY_NAME_LEN - 1);
-              } else {
-                snprintf(galleryFiles[count], GALLERY_NAME_LEN, "/%s", name.c_str());
-              }
-              galleryFiles[count][GALLERY_NAME_LEN - 1] = '\0';
-              count++;
-            }
-          }
-        }
-        f = root.openNextFile();
-      }
-      root.close();
-    }
-    xSemaphoreGive(spiMutex);
-  }
-
-  galleryFileCount = count;
-  galleryIndex = 0;
-  Serial.printf("[GAL] Found %d %s files\n", count, videosOnly ? "video" : "photo");
-}
-
-// Release gallery file index memory.
-void freeGalleryFiles() {
-  if (galleryFiles) {
-    for (int i = 0; i < galleryFileCount; i++) {
-      if (galleryFiles[i]) free(galleryFiles[i]);
-    }
-    free(galleryFiles);
-    galleryFiles = nullptr;
-  }
-  galleryFileCount = 0;
-  galleryIndex = 0;
-}
-
-// Draw the gallery type selection menu (Photos / Videos).
-void drawGalleryTypeMenu() {
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextDatum(middle_center);
-
-    // Title
-    tft.setTextSize(2);
-    tft.setTextColor(TFT_CYAN);
-    tft.drawString("GALLERY", tft.width() / 2, 30);
-
-    // Photos option
-    tft.setTextSize(2);
-    if (galleryTypeSelection == 0) {
-      tft.fillRoundRect(60, 75, 200, 40, 8, TFT_CYAN);
-      tft.setTextColor(TFT_BLACK);
-    } else {
-      tft.drawRoundRect(60, 75, 200, 40, 8, 0x4208);
-      tft.setTextColor(0x7BEF);
-    }
-    tft.drawString("Photos", tft.width() / 2, 95);
-
-    // Videos option
-    tft.setTextSize(2);
-    if (galleryTypeSelection == 1) {
-      tft.fillRoundRect(60, 135, 200, 40, 8, TFT_CYAN);
-      tft.setTextColor(TFT_BLACK);
-    } else {
-      tft.drawRoundRect(60, 135, 200, 40, 8, 0x4208);
-      tft.setTextColor(0x7BEF);
-    }
-    tft.drawString("Videos", tft.width() / 2, 155);
-
-    // Footer hint
-    tft.setTextSize(1);
-    tft.setTextColor(0x4208);
-    tft.drawString("Click: Select  Long: Back", tft.width() / 2, 225);
-
-    tft.setTextDatum(top_left);
-    xSemaphoreGive(spiMutex);
-  }
-}
-
-// Display a single photo from the gallery.
-// Reads JPEG file into dispBuf[0] (safe because taskCapture skips copy during gallery),
-// then decodes with LovyanGFX drawJpg at 0.25f scale (HD 1280x720 -> 320x180).
-void drawGalleryPhoto() {
-  if (galleryFileCount == 0 || galleryIndex >= galleryFileCount) return;
-  if (!globalSDState.isMounted) return;
-
-  const char *filePath = galleryFiles[galleryIndex];
-
-  // Read JPEG into dispBuf[0] (PSRAM, camera copy paused during gallery)
-  uint8_t *jpgBuf = dispBuf[0];
-  size_t jpgLen = 0;
-
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    File f = SD.open(filePath, FILE_READ);
-    if (f) {
-      size_t fsize = f.size();
-      if (fsize <= DISP_BUF_SIZE && jpgBuf) {
-        jpgLen = f.read(jpgBuf, fsize);
-      }
-      f.close();
-    }
-    xSemaphoreGive(spiMutex);
-  }
-
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextDatum(middle_center);
-
-    // Header: index / total
-    tft.setTextSize(1);
-    tft.setTextColor(TFT_WHITE);
-    char header[32];
-    snprintf(header, sizeof(header), "%d / %d", galleryIndex + 1, galleryFileCount);
-    tft.drawString(header, tft.width() / 2, 8);
-
-    // Filename (strip leading /)
-    tft.setTextColor(TFT_CYAN);
-    const char *dispName = filePath;
-    if (dispName[0] == '/') dispName++;
-    tft.drawString(dispName, tft.width() / 2, 20);
-
-    if (jpgLen > 0) {
-      // HD (1280x720) at 0.25f = 320x180, drawn at y=30
-      tft.drawJpg(jpgBuf, jpgLen, 0, 30, 320, 180, 0, 0, 0.25f);
-    } else {
-      tft.setTextSize(2);
-      tft.setTextColor(TFT_RED);
-      tft.drawString("Cannot display", tft.width() / 2, 120);
-    }
-
-    // Footer
-    tft.setTextSize(1);
-    tft.setTextColor(0x4208);
-    tft.drawString("Click:Delete  Long:Back", tft.width() / 2, 225);
-
-    tft.setTextDatum(top_left);
-    xSemaphoreGive(spiMutex);
-  }
-}
-
-// Extract the Nth JPEG frame from an AVI file's MOVI list.
-// Returns the JPEG data size written to buf, or 0 on failure.
-// Caller must hold spiMutex (SD file access) and ensure buf is large enough.
-size_t extractAVIFrame(File &aviFile, uint8_t *buf, size_t bufSize, int targetFrame) {
-  if (!aviFile || !buf || bufSize == 0) return 0;
-
-  aviFile.seek(avi_header_size);  // skip AVI header, enter MOVI
-
-  int videoFrameIdx = 0;
-  uint8_t tag[4];
-
-  while (aviFile.read(tag, 4) == 4) {
-    uint32_t chunkSize = 0;
-    if (aviFile.read((uint8_t*)&chunkSize, 4) != 4) break;
-
-    // Stop at idx1 marker
-    if (tag[0] == 'i' && tag[1] == 'd' && tag[2] == 'x' && tag[3] == '1') break;
-
-    // "00dc" = video frame (JPEG)
-    if (tag[0] == 0x30 && tag[1] == 0x30 && tag[2] == 0x64 && tag[3] == 0x63) {
-      if (videoFrameIdx == targetFrame && chunkSize > 0 && chunkSize <= bufSize) {
-        size_t rd = aviFile.read(buf, chunkSize);
-        return (rd == chunkSize) ? chunkSize : 0;
-      }
-      videoFrameIdx++;
-    }
-
-    // Skip this chunk's data (seek past it)
-    aviFile.seek(aviFile.position() + chunkSize);
-  }
-
-  return 0;  // target frame not found
-}
-
-// Display a single video item with thumbnail background + overlaid play icon and info.
-// Extracts frame 12 (0-indexed) from the AVI as thumbnail. Falls back to plain icon
-// if extraction fails.
-void drawGalleryVideoItem() {
-  if (galleryFileCount == 0 || galleryIndex >= galleryFileCount) return;
-
-  const char *filePath = galleryFiles[galleryIndex];
-
-  // Try to extract a thumbnail frame (frame 12 ≈ 1.2s into video at 10fps)
-  uint8_t *thumbBuf = dispBuf[0];  // safe — camera copy paused during gallery
-  size_t thumbLen = 0;
-  float sizeMB = 0;
-
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    File aviFile = SD.open(filePath, FILE_READ);
-    if (aviFile) {
-      sizeMB = aviFile.size() / 1048576.0f;
-      thumbLen = extractAVIFrame(aviFile, thumbBuf, DISP_BUF_SIZE, 12);
-      aviFile.close();
-    }
-    xSemaphoreGive(spiMutex);
-  }
-
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextDatum(middle_center);
-
-    // Background: thumbnail or plain black
-    if (thumbLen > 0) {
-      // HVGA (480x320) at 0.5f = 240x160, centered on 320x240 screen
-      tft.drawJpg(thumbBuf, thumbLen, 40, 20, 240, 160, 0, 0, 0.5f);
-    }
-
-    // Header: index / total (top bar, on a dark strip)
-    tft.fillRect(0, 0, 320, 16, TFT_BLACK);
-    tft.setTextSize(1);
-    tft.setTextColor(TFT_WHITE);
-    char header[32];
-    snprintf(header, sizeof(header), "%d / %d", galleryIndex + 1, galleryFileCount);
-    tft.drawString(header, tft.width() / 2, 8);
-
-    // Play icon (triangle) with dark surround for visibility
-    int cx = tft.width() / 2;
-    int cy = 100;  // center of play icon
-    // Dark circle behind play button
-    tft.fillCircle(cx + 2, cy, 32, tft.color565(0, 0, 0));
-    tft.drawCircle(cx + 2, cy, 33, tft.color565(60, 60, 60));
-    // Play triangle
-    tft.fillTriangle(cx - 12, cy - 18, cx - 12, cy + 18, cx + 20, cy, TFT_CYAN);
-
-    // Filename on a dark background strip (strip leading /)
-    const char *dispName = filePath;
-    if (dispName[0] == '/') dispName++;
-    int nameW = strlen(dispName) * 12 + 16;  // approximate width at textSize 2
-    int nameX = (320 - nameW) / 2;
-    if (nameX < 0) nameX = 0;
-    tft.fillRect(nameX, 138, nameW, 22, tft.color565(0, 0, 0));
-    tft.setTextSize(2);
-    tft.setTextColor(TFT_WHITE);
-    tft.drawString(dispName, tft.width() / 2, 149);
-
-    // File size on a dark background strip
-    char sizeStr[16];
-    snprintf(sizeStr, sizeof(sizeStr), "%.1f MB", sizeMB);
-    int sizeW = strlen(sizeStr) * 6 + 12;  // approximate width at textSize 1
-    int sizeX = (320 - sizeW) / 2;
-    tft.fillRect(sizeX, 164, sizeW, 14, tft.color565(0, 0, 0));
-    tft.setTextSize(1);
-    tft.setTextColor(0x7BEF);
-    tft.drawString(sizeStr, tft.width() / 2, 171);
-
-    // Footer
-    tft.fillRect(0, 218, 320, 22, TFT_BLACK);
-    tft.setTextSize(1);
-    tft.setTextColor(0x4208);
-    tft.drawString("Click:Play  Long:Back", tft.width() / 2, 225);
-
-    tft.setTextDatum(top_left);
-    xSemaphoreGive(spiMutex);
-  }
-}
-
-// Draw the delete confirmation dialog.
-void drawDeleteConfirm() {
-  if (galleryFileCount == 0 || galleryIndex >= galleryFileCount) return;
-
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextDatum(middle_center);
-
-    // Title
-    tft.setTextSize(2);
-    tft.setTextColor(TFT_RED);
-    tft.drawString("DELETE FILE?", tft.width() / 2, 30);
-
-    // Filename
-    tft.setTextSize(1);
-    tft.setTextColor(TFT_WHITE);
-    const char *dispName = galleryFiles[galleryIndex];
-    if (dispName[0] == '/') dispName++;
-    tft.drawString(dispName, tft.width() / 2, 60);
-
-    // First option: Cancel (photos) or Play (videos)
-    tft.setTextSize(2);
-    bool isVideo = (galleryTypeSelection == 1);
-    if (deleteSelection == 0) {
-      tft.fillRoundRect(60, 90, 200, 40, 8, isVideo ? TFT_CYAN : TFT_GREEN);
-      tft.setTextColor(TFT_BLACK);
-    } else {
-      tft.drawRoundRect(60, 90, 200, 40, 8, 0x4208);
-      tft.setTextColor(0x7BEF);
-    }
-    tft.drawString(isVideo ? "Play" : "Cancel", tft.width() / 2, 110);
-
-    // Delete option
-    tft.setTextSize(2);
-    if (deleteSelection == 1) {
-      tft.fillRoundRect(60, 150, 200, 40, 8, TFT_RED);
-      tft.setTextColor(TFT_WHITE);
-    } else {
-      tft.drawRoundRect(60, 150, 200, 40, 8, 0x4208);
-      tft.setTextColor(0x7BEF);
-    }
-    tft.drawString("Delete", tft.width() / 2, 170);
-
-    // Footer
-    tft.setTextSize(1);
-    tft.setTextColor(0x4208);
-    tft.drawString("Long press: Back", tft.width() / 2, 225);
-
-    tft.setTextDatum(top_left);
-    xSemaphoreGive(spiMutex);
-  }
-}
-
-// Silent AVI video playback on TFT.
-// Parses MOVI LIST for 00dc (JPEG) chunks, skips 01wb (audio) chunks.
-// Uses dispBuf[0] as frame read buffer (safe — camera copy is paused).
-// Runs in taskDisplay context; consumes encoder events for pause/stop.
-void playVideoOnTFT() {
-  if (galleryFileCount == 0 || galleryIndex >= galleryFileCount) {
-    appState = STATE_GALLERY_VIDEOS;
-    galleryNeedsRedraw = true;
-    return;
-  }
-
-  const char *filePath = galleryFiles[galleryIndex];
-
-  File aviFile;
-  bool opened = false;
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    aviFile = SD.open(filePath, FILE_READ);
-    opened = (bool)aviFile;
-    xSemaphoreGive(spiMutex);
-  }
-
-  if (!opened) {
-    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-      tft.fillScreen(TFT_BLACK);
-      tft.setTextDatum(middle_center);
-      tft.setTextSize(2);
-      tft.setTextColor(TFT_RED);
-      tft.drawString("Cannot open file", tft.width() / 2, 110);
-      tft.setTextDatum(top_left);
-      xSemaphoreGive(spiMutex);
-    }
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    appState = STATE_GALLERY_VIDEOS;
-    galleryNeedsRedraw = true;
-    return;
-  }
-
-  Serial.printf("[GAL] Playing: %s\n", filePath);
-
-  // Clear screen for playback
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    tft.fillScreen(TFT_BLACK);
-    xSemaphoreGive(spiMutex);
-  }
-
-  // Read microSecPerFrame from AVI header (offset 32, 4 bytes LE) so playback
-  // speed matches the actual recording rate, even if capture FPS varied.
-  uint32_t microSecPerFrame = 0;
-  uint32_t frameTimeMs = 1000 / TARGET_FPS;  // fallback: 100ms
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    aviFile.seek(32);
-    if (aviFile.read((uint8_t*)&microSecPerFrame, 4) == 4 &&
-        microSecPerFrame > 0 && microSecPerFrame < 1000000) {
-      frameTimeMs = microSecPerFrame / 1000;
-      Serial.printf("[GAL] AVI microSecPerFrame=%u → %u ms/frame\n",
-                    microSecPerFrame, frameTimeMs);
-    } else {
-      Serial.printf("[GAL] Bad microSecPerFrame (%u), using default %u ms\n",
-                    microSecPerFrame, frameTimeMs);
-    }
-    // Seek to MOVI chunk data start (past header)
-    aviFile.seek(avi_header_size);
-    xSemaphoreGive(spiMutex);
-  }
-
-  uint8_t *frameBuf = dispBuf[0];  // reuse display buffer (camera copy paused)
-  bool paused = false;
-  bool stopped = false;
-  int frameNum = 0;
-  int unknownChunks = 0;
-
-  while (!stopped && appState == STATE_VIDEO_PLAYING) {
-    // Check for input events (pause/stop)
-    InputEvent ev;
-    while (xQueueReceive(inputEventQueue, &ev, 0) == pdTRUE) {
-      if (ev.type == INPUT_ENC_CLICK) {
-        paused = !paused;
-        if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(50))) {
-          if (paused) {
-            // Draw pause indicator (two vertical bars)
-            tft.fillRect(145, 5, 30, 20, TFT_BLACK);
-            tft.fillRect(148, 7, 8, 16, TFT_WHITE);
-            tft.fillRect(160, 7, 8, 16, TFT_WHITE);
-          } else {
-            // Clear pause indicator on resume
-            tft.fillRect(145, 5, 30, 20, TFT_BLACK);
-          }
-          xSemaphoreGive(spiMutex);
-        }
-      } else if (ev.type == INPUT_ENC_LONG) {
-        stopped = true;
-      }
-    }
-
-    if (paused) {
-      vTaskDelay(pdMS_TO_TICKS(50));
-      continue;
-    }
-
-    uint32_t frameStart = millis();
-
-    // ── Single mutex lock: read chunk header + data + draw ──
-    // Batching eliminates 3 extra FreeRTOS context switches per frame.
-    uint8_t tag[4];
-    uint32_t chunkSize = 0;
-    size_t bytesRead = 0;
-    bool endOfData = false;
-    bool drewFrame = false;  // only apply frame timing after a video frame
-
-    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-      bytesRead = aviFile.read(tag, 4);
-      if (bytesRead == 4) {
-        aviFile.read((uint8_t*)&chunkSize, 4);
-      }
-
-      if (bytesRead < 4) {
-        endOfData = true;
-      } else if (tag[0] == 'i' && tag[1] == 'd' && tag[2] == 'x' && tag[3] == '1') {
-        endOfData = true;
-      }
-      // "00dc" = video frame (JPEG)
-      else if (tag[0] == 0x30 && tag[1] == 0x30 && tag[2] == 0x64 && tag[3] == 0x63) {
-        unknownChunks = 0;
-        if (chunkSize > 0 && chunkSize <= DISP_BUF_SIZE && frameBuf) {
-          size_t rd = aviFile.read(frameBuf, chunkSize);
-          if (rd == chunkSize) {
-            tft.drawJpg(frameBuf, chunkSize, 40, 40, 240, 160, 0, 0, 0.5f);
-            frameNum++;
-            drewFrame = true;
-            // Frame counter overlay
-            tft.setTextSize(1);
-            tft.setTextColor(TFT_GREEN, TFT_BLACK);
-            tft.setCursor(4, 4);
-            tft.printf("F:%d", frameNum);
-          }
-        } else {
-          aviFile.seek(aviFile.position() + chunkSize);
-        }
-      }
-      // "01wb" = audio chunk — skip
-      else if (tag[0] == 0x30 && tag[1] == 0x31 && tag[2] == 0x77 && tag[3] == 0x62) {
-        unknownChunks = 0;
-        aviFile.seek(aviFile.position() + chunkSize);
-      }
-      // Unknown chunk — skip
-      else {
-        unknownChunks++;
-        if (unknownChunks > 10) {
-          Serial.println("[GAL] Too many unknown chunks, aborting playback.");
-          endOfData = true;
-        } else {
-          aviFile.seek(aviFile.position() + chunkSize);
-        }
-      }
-      xSemaphoreGive(spiMutex);
-    }
-
-    if (endOfData) break;
-
-    // Frame timing — only after rendering a video frame.
-    // Audio/unknown chunks loop back immediately with no delay so they
-    // don't double the effective per-frame interval.
-    if (drewFrame) {
-      uint32_t elapsed = millis() - frameStart;
-      if (elapsed < frameTimeMs) {
-        vTaskDelay(pdMS_TO_TICKS(frameTimeMs - elapsed));
-      }
-    }
-  }
-
-  // Close file and return to video list
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    aviFile.close();
-    xSemaphoreGive(spiMutex);
-  }
-
-  Serial.printf("[GAL] Playback ended. Frames: %d, stopped: %d\n", frameNum, (int)stopped);
-
-  if (stopped) {
-    // User pressed ENC_LONG during playback → offer delete
-    deleteSelection = 0;
-    appState = STATE_DELETE_CONFIRM;
-  } else {
-    // Natural EOF — return to video list
-    appState = STATE_GALLERY_VIDEOS;
-  }
-  galleryNeedsRedraw = true;
-  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
 }

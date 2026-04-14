@@ -1,6 +1,6 @@
 # XIAO ESP32-S3 Sense Retro Camera
 
-A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Sense. Captures high-resolution photos and MJPEG/PCM audio video, with a live viewfinder on a 2.0" TFT display. Features a full encoder-driven menu system with on-device gallery (including video thumbnail previews), camera settings, and a tabbed wireless file manager. Runs a multi-task FreeRTOS architecture for robust, concurrent operation.
+A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Sense. Captures high-resolution photos and MJPEG/PCM audio video, with a live viewfinder on a 2.0" TFT display. Features a full encoder-driven menu system with on-device gallery (including video thumbnail previews), camera settings, and a tabbed wireless file manager. Modular codebase with a multi-task FreeRTOS architecture for robust, concurrent operation.
 
 ---
 
@@ -11,7 +11,6 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **Live Viewfinder** — Real-time 320×240 RGB565 camera preview on the TFT display
 - **Main Menu** — Encoder-driven main menu with Gallery, WiFi Transfer, Camera Settings, and Exit options
 - **Camera Settings** — On-device configuration of 9 sensor parameters (brightness, contrast, saturation, AE level, white balance, special effects, mirror, flip, JPEG quality) with NVS persistence
-- **Hardware Mirroring** — Toggle horizontal flip (selfie mode) via the built-in Boot button
 - **FPS Counter & SD Status** — Live overlay showing frame rate and SD card health
 - **WiFi File Server** — AP mode with a tabbed HTML file manager (Photos / Videos tabs with file count badges, alphabetically sorted); download, preview, or delete assets wirelessly with video thumbnail support
 - **On-Device Gallery** — Browse photos and videos on the TFT; video items show a thumbnail preview (frame ~1.2 s into the clip) with a play button, filename, and size overlaid on dark strips
@@ -32,7 +31,6 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 | Display | 2.0" TFT LCD — ST7789VW, 240×320, SPI |
 | Rotary Encoder | EC11 with push button (CLK: GPIO 6, DT: GPIO 43, SW: GPIO 44) |
 | Shutter button | 1× tactile button (GPIO 4 / GPIO 5) |
-| Mirror button | Built-in Boot button (GPIO 0) |
 | Storage | MicroSD card, FAT32 formatted |
 | Power | 3.7 V Li-ion battery or USB-C |
 
@@ -68,7 +66,7 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
           <tr><td>Encoder SW (Button)</td><td>GPIO 44 (INPUT_PULLUP)</td></tr>
           <tr><td>Shutter — leg 1</td><td>GPIO 4 (OUTPUT)</td></tr>
           <tr><td>Shutter — leg 2</td><td>GPIO 5 (INPUT_PULLUP)</td></tr>
-          <tr><td>Mirror toggle</td><td>GPIO 0 (Boot, built-in)</td></tr>
+          <tr><td>Boot button</td><td>GPIO 0 (disabled — mirror via Settings menu)</td></tr>
           <tr><td>SD Card CS</td><td>GPIO 21</td></tr>
           <tr><td>Mic CLK (PDM)</td><td>GPIO 42</td></tr>
           <tr><td>Mic DATA (PDM)</td><td>GPIO 41</td></tr>
@@ -98,7 +96,7 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 2. Install **esp32 by Espressif Systems** (v3.x+)
 3. Board: **XIAO_ESP32S3** | PSRAM: **OPI PSRAM**
 4. Install **LovyanGFX** via Library Manager
-5. Open `src/main.cpp`, upload
+5. Open `src/main.cpp` (or the whole project folder), upload
 
 ---
 
@@ -115,15 +113,12 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - Screen shows blinking red indicator + elapsed time HH:MM:SS
 - **Press again** to stop (minimum 2 s of recording)
 
-### Image Mirroring
-- Press the **Boot button** (GPIO 0) to toggle horizontal flip
-
 ### WiFi File Manager
-- **Long press** the **Boot button** (> 800 ms) in Idle mode to enter WiFi AP mode
+- Select **WiFi Transfer** from the main menu (requires SD card)
 - Connect your phone/PC to `Retro_Cam` (password: `barkinsarikartal`)
 - Navigate to `http://192.168.4.1` — tabbed interface: **Photos** and **Videos** tabs, each sorted alphabetically with file count badges
 - Both photos and videos display thumbnail previews; video thumbnails are extracted from frame ~1.2 s into the clip
-- Press the encoder click/long or Boot long to exit WiFi mode and resume camera
+- Press the encoder click/long to exit WiFi mode and resume camera
 
 ### SD Card Status
 - **Green dot** (bottom-right) = SD ready
@@ -156,6 +151,17 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - Available settings: Brightness, Contrast, Saturation, AE Level, White Balance, Special Effect, Mirror, Flip, JPEG Quality
 
 ---
+### Source Code Structure
+
+| File | Responsibility |
+|---|---|
+| `shared.h` | Common includes, defines, structs, enums, LGFX class, extern declarations, prototypes |
+| `main.cpp` | setup/loop, FreeRTOS tasks (capture, display, recorder, input, SD monitor), ISRs, camera/mic init |
+| `avi_writer.cpp` | AVI file creation: startAVI, writeAVIFrameFromBuf, writeAVIAudioChunk, endAVI |
+| `wifi_server.cpp` | WiFi AP + async web server with tabbed HTML file manager |
+| `gallery.cpp` | On-device gallery: photo/video browsing, AVI frame extraction, video playback |
+| `settings.cpp` | Camera settings: NVS load/save, applySettings, settings & main menu UI |
+
 
 ## Technical Details
 
