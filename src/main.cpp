@@ -33,6 +33,11 @@
 //      1            ->        GPIO4
 //      2            ->        GPIO5
 
+// Rotary Encoder    ->    XIAO ESP32-S3
+//      CLK          ->        GPIO6
+//      DT           ->        GPIO43
+//      SW           ->        GPIO44
+
 // ================= EXTERNAL PINS =================
 #define TFT_CS            1
 #define TFT_DC            2
@@ -88,7 +93,7 @@
 #define IDLE_JPEG_QUALITY 0
 
 // ================= FIRMWARE VERSION =================
-#define FIRMWARE_VERSION "v0.8"
+#define FIRMWARE_VERSION "v0.9"
 
 // ================= WIFI AP CONFIG =================
 #define WIFI_SSID "Retro_Cam"
@@ -258,7 +263,10 @@ i2s_chan_handle_t i2s_rx_handle = NULL;
 
 // ================= FRAME MANAGEMENT =================
 // Display double buffer (ping-pong): decouples capture from TFT rendering
-#define FRAME_BUF_SIZE     (160 * 1024)  // 160KB covers both QVGA RGB565 and HVGA JPEG
+// Separate sizes to reduce PSRAM usage: display needs 160KB (QVGA RGB565 = 150KB,
+// HD JPEG gallery < 160KB), but recorder only needs 80KB (HVGA JPEG @ q12 ≈ 15-25KB).
+#define DISP_BUF_SIZE      (160 * 1024)  // display + gallery JPEG decode
+#define REC_BUF_SIZE       (80 * 1024)   // HVGA JPEG frames during recording
 uint8_t *dispBuf[2] = {nullptr, nullptr};
 volatile size_t dispLen[2] = {0, 0};
 // std::atomic gives correct memory-ordering guarantees on ESP32-S3 SMP.
@@ -343,6 +351,7 @@ void drawMenuMain();
 void drawGalleryTypeMenu();
 void drawGalleryPhoto();
 void drawGalleryVideoItem();
+size_t extractAVIFrame(File &aviFile, uint8_t *buf, size_t bufSize, int targetFrame);
 void drawDeleteConfirm();
 void drawSettingsMenu();
 void playVideoOnTFT();
@@ -467,11 +476,11 @@ void loop() {
 // ================= BUFFER ALLOCATION =================
 void allocateBuffers() {
   for (int i = 0; i < 2; i++) {
-    dispBuf[i] = (uint8_t*)ps_malloc(FRAME_BUF_SIZE);
+    dispBuf[i] = (uint8_t*)ps_malloc(DISP_BUF_SIZE);
     if (!dispBuf[i]) Serial.printf("[ERR] dispBuf[%d] alloc failed!\n", i);
   }
   for (int i = 0; i < REC_POOL_SIZE; i++) {
-    recPool[i] = (uint8_t*)ps_malloc(FRAME_BUF_SIZE);
+    recPool[i] = (uint8_t*)ps_malloc(REC_BUF_SIZE);
     if (!recPool[i]) Serial.printf("[ERR] recPool[%d] alloc failed!\n", i);
   }
   audioRecBuf = (int16_t*)ps_malloc(AUDIO_REC_BUF_SIZE);
@@ -538,30 +547,16 @@ void taskSDMonitor(void *pvParameters) {
       continue;
     }
 
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    // During recording: skip SD polling entirely. SD removal and space
+    // exhaustion are caught by taskRecorder's write error path, which sends
+    // EVT_SD_STOP. Polling here would compete for spiMutex with the recorder
+    // on every cycle, reducing effective write throughput.
+    if (appState == STATE_RECORDING || appState == STATE_STOPPING) {
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      continue;
+    }
 
-      // during recording: only check free space
-      if (appState == STATE_RECORDING) {
-        bool shouldStop = false;
-        if (SD.cardType() == CARD_NONE || SD.totalBytes() == 0) {
-          shouldStop = true;
-          Serial.println("SD card removed during recording!");
-        }
-        else {
-          uint64_t freeBytes = SD.totalBytes() - SD.usedBytes();
-          Serial.println("Free space during recording: " + String(freeBytes / 1024) + " KB");
-          if (freeBytes < 10 * 1024 * 1024) {
-            shouldStop = true;
-            Serial.println("SD card nearly full during recording!");
-          }
-        }
-        if (shouldStop) {
-          xEventGroupSetBits(appEvents, EVT_SD_STOP);
-        }
-        xSemaphoreGive(spiMutex);
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        continue;
-      }
+    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
 
       bool currentMount = false;
       bool currentFull = false;
@@ -1311,7 +1306,7 @@ void taskCapture(void *pvParameters) {
       AppState cs = appState;
       if (cs == STATE_IDLE || cs == STATE_RECORDING) {
         int ws = dispWriteSlot.load();
-        if (ws != dispRendering.load() && fb->len <= FRAME_BUF_SIZE && dispBuf[ws]) {
+        if (ws != dispRendering.load() && fb->len <= DISP_BUF_SIZE && dispBuf[ws]) {
           memcpy(dispBuf[ws], fb->buf, fb->len);
           dispLen[ws] = fb->len;
           dispReadSlot.store(ws);
@@ -1326,7 +1321,7 @@ void taskCapture(void *pvParameters) {
       if (xSemaphoreTake(recPoolFree, 0) == pdTRUE) {
         int idx = recPoolWriteIdx;
         recPoolWriteIdx = (recPoolWriteIdx + 1) % REC_POOL_SIZE;
-        if (recPool[idx] && fb->len <= FRAME_BUF_SIZE) {
+        if (recPool[idx] && fb->len <= REC_BUF_SIZE) {
           memcpy(recPool[idx], fb->buf, fb->len);
           RecFrame rf = { idx, (size_t)fb->len };
           xQueueSend(recFrameQueue, &rf, 0);
@@ -1708,7 +1703,7 @@ void applySettings(sensor_t *s) {
 }
 
 // ================= WIFI FILE SERVER =================
-// Embedded HTML — mobile-first dark theme file manager with photo thumbnails.
+// Embedded HTML — mobile-first dark theme file manager with tabbed photo/video views.
 // Served from PROGMEM to avoid PSRAM/heap allocation for static content.
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -1721,12 +1716,15 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',system-ui,sans-serif;background:#111;color:#e0e0e0;padding:16px;max-width:600px;margin:0 auto}
 h1{font-size:1.4em;margin-bottom:12px;color:#fff}
-.bar{background:#222;border-radius:8px;overflow:hidden;height:24px;margin-bottom:16px;position:relative}
+.bar{background:#222;border-radius:8px;overflow:hidden;height:24px;margin-bottom:12px;position:relative}
 .bar-fill{height:100%;background:linear-gradient(90deg,#2ecc71,#27ae60);transition:width .3s}
 .bar-text{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:.8em;color:#fff;white-space:nowrap}
+.tabs{display:flex;gap:8px;margin-bottom:12px}
+.tab{flex:1;padding:10px;border:none;border-radius:8px;cursor:pointer;font-size:.9em;font-weight:600;background:#222;color:#888;text-align:center;transition:all .2s}
+.tab.active{background:#2980b9;color:#fff}
+.tab .badge{display:inline-block;background:rgba(0,0,0,.3);border-radius:10px;padding:1px 7px;font-size:.75em;margin-left:4px}
 .file{display:flex;align-items:center;background:#1a1a1a;border-radius:8px;padding:10px 12px;margin-bottom:8px;border:1px solid #2a2a2a}
 .thumb{width:80px;height:45px;border-radius:4px;object-fit:cover;flex-shrink:0;background:#222}
-.vid-thumb{width:80px;height:45px;border-radius:4px;flex-shrink:0;background:#222;display:flex;align-items:center;justify-content:center;font-size:1.6em;color:#666}
 .file-info{flex:1;min-width:0;margin-left:10px}
 .file-name{font-size:.9em;word-break:break-all;color:#fff}
 .file-size{font-size:.75em;color:#888;margin-top:2px}
@@ -1749,10 +1747,37 @@ h1{font-size:1.4em;margin-bottom:12px;color:#fff}
 <h1>&#128247; Retro Cam Files</h1>
 <div id="status"></div>
 <div class="bar"><div class="bar-fill" id="barFill"></div><div class="bar-text" id="barText">Loading...</div></div>
+<div class="tabs">
+ <button class="tab active" id="tabPhotos" onclick="switchTab('photos')">&#128248; Photos <span class="badge" id="cntPhotos">0</span></button>
+ <button class="tab" id="tabVideos" onclick="switchTab('videos')">&#127916; Videos <span class="badge" id="cntVideos">0</span></button>
+</div>
 <div id="list"><div class="empty">Loading...</div></div>
 <div class="modal-bg" id="modalBg"><div class="modal"><p id="modalMsg">Delete?</p><div class="btns"><button class="btn btn-dl" onclick="closeModal()">Cancel</button><button class="btn btn-del" id="modalDel">Delete</button></div></div></div>
 <script>
-let delTarget='';
+let delTarget='',allFiles=[],curTab='photos';
+function switchTab(t){
+ curTab=t;
+ document.getElementById('tabPhotos').className='tab'+(t==='photos'?' active':'');
+ document.getElementById('tabVideos').className='tab'+(t==='videos'?' active':'');
+ renderFiles();
+}
+function renderFiles(){
+ let el=document.getElementById('list');
+ let filtered=allFiles.filter(f=>curTab==='videos'?f.isVideo:!f.isVideo);
+ filtered.sort((a,b)=>a.name.localeCompare(b.name));
+ if(!filtered.length){el.innerHTML='<div class="empty">No '+(curTab==='videos'?'videos':'photos')+' on SD card</div>';return;}
+ let h='';
+ filtered.forEach(f=>{
+  let sz=f.size<1048576?(f.size/1024).toFixed(1)+' KB':(f.size/1048576).toFixed(1)+' MB';
+  h+='<div class="file">';
+  h+='<img class="thumb" loading="lazy" src="/api/preview?file='+encodeURIComponent(f.name)+'" alt="">';
+  h+='<div class="file-info"><div class="file-name">'+f.name+'</div><div class="file-size">'+sz+'</div></div><div class="btns">';
+  h+='<a class="btn btn-dl" download href="/api/download?file='+encodeURIComponent(f.name)+'">&#11015;</a>';
+  h+='<button class="btn btn-del" onclick="confirmDel(\''+f.name.replace(/'/g,"\\'")+'\')">\&#128465;</button>';
+  h+='</div></div>';
+ });
+ el.innerHTML=h;
+}
 function load(){
  fetch('/api/info').then(r=>r.json()).then(d=>{
   if(d.error){document.getElementById('barText').textContent='SD card unavailable';return;}
@@ -1762,21 +1787,13 @@ function load(){
   document.getElementById('barText').textContent=fmt(d.used)+' / '+fmt(d.total)+' ('+fmt(d.free)+' free)';
  }).catch(()=>{document.getElementById('barText').textContent='Connection error';});
  fetch('/api/files').then(r=>r.json()).then(files=>{
-  let el=document.getElementById('list');
-  if(files.error){el.innerHTML='<div class="err">'+files.error+'</div>';return;}
-  if(!files.length){el.innerHTML='<div class="empty">No files on SD card</div>';return;}
-  let h='';
-  files.forEach(f=>{
-   let sz=f.size<1048576?(f.size/1024).toFixed(1)+' KB':(f.size/1048576).toFixed(1)+' MB';
-   h+='<div class="file">';
-   if(f.isVideo){h+='<div class="vid-thumb">&#127916;</div>';}
-   else{h+='<img class="thumb" loading="lazy" src="/api/preview?file='+encodeURIComponent(f.name)+'" alt="">';}
-   h+='<div class="file-info"><div class="file-name">'+f.name+'</div><div class="file-size">'+sz+'</div></div><div class="btns">';
-   h+='<a class="btn btn-dl" download href="/api/download?file='+encodeURIComponent(f.name)+'">&#11015;</a>';
-   h+='<button class="btn btn-del" onclick="confirmDel(\''+f.name.replace(/'/g,"\\'")+'\')">&#128465;</button>';
-   h+='</div></div>';
-  });
-  el.innerHTML=h;
+  if(files.error){document.getElementById('list').innerHTML='<div class="err">'+files.error+'</div>';return;}
+  allFiles=files;
+  let photos=files.filter(f=>!f.isVideo).length;
+  let videos=files.filter(f=>f.isVideo).length;
+  document.getElementById('cntPhotos').textContent=photos;
+  document.getElementById('cntVideos').textContent=videos;
+  renderFiles();
  }).catch(()=>{document.getElementById('list').innerHTML='<div class="err">Connection error</div>';});
 }
 function confirmDel(name){delTarget=name;document.getElementById('modalMsg').textContent='Delete '+name+'?';document.getElementById('modalBg').classList.add('show');}
@@ -1931,6 +1948,8 @@ void startWiFiMode() {
   });
 
   // Route: preview file inline (for thumbnail <img> tags — no Content-Disposition)
+  // For .jpg files: streams the full file as before.
+  // For .avi files: extracts frame 12 JPEG from MOVI list and sends it.
   webServer->on("/api/preview", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!request->hasParam("file")) {
       request->send(400, "text/plain", "Missing file param");
@@ -1943,36 +1962,79 @@ void startWiFiMode() {
     String filename = request->getParam("file")->value();
     if (!filename.startsWith("/")) filename = "/" + filename;
 
-    auto fp = std::make_shared<File>();
-    bool opened = false;
-    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-      *fp = SD.open(filename, FILE_READ);
-      opened = (bool)*fp;
-      xSemaphoreGive(spiMutex);
-    }
-    if (!opened) {
-      request->send(404, "text/plain", "Not found");
-      return;
-    }
+    bool isAvi = filename.endsWith(".avi");
 
-    AsyncWebServerResponse *response = request->beginChunkedResponse(
-      "image/jpeg",
-      [fp](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-        if (!*fp) return 0;
-        size_t bytesRead = 0;
-        if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-          bytesRead = fp->read(buffer, maxLen);
-          if (bytesRead == 0) {
-            fp->close();
-          }
-          xSemaphoreGive(spiMutex);
-        }
-        return bytesRead;
+    if (isAvi) {
+      // AVI video thumbnail: extract a single JPEG frame into PSRAM, send it.
+      // We use a temporary ps_malloc buffer because the async callback would need
+      // the file open across multiple chunks — but we want to extract and close.
+      uint8_t *thumbBuf = (uint8_t*)ps_malloc(REC_BUF_SIZE);
+      if (!thumbBuf) {
+        request->send(500, "text/plain", "PSRAM alloc failed");
+        return;
       }
-    );
-    // Cache thumbnails in browser for 5 min — avoid re-downloading on page reload
-    response->addHeader("Cache-Control", "max-age=300");
-    request->send(response);
+      size_t thumbLen = 0;
+      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+        File aviFile = SD.open(filename, FILE_READ);
+        if (aviFile) {
+          thumbLen = extractAVIFrame(aviFile, thumbBuf, REC_BUF_SIZE, 12);
+          aviFile.close();
+        }
+        xSemaphoreGive(spiMutex);
+      }
+      if (thumbLen == 0) {
+        free(thumbBuf);
+        request->send(404, "text/plain", "No frame found");
+        return;
+      }
+      // Wrap buffer in shared_ptr for automatic cleanup after response
+      auto bufPtr = std::shared_ptr<uint8_t>(thumbBuf, free);
+      size_t totalLen = thumbLen;
+      AsyncWebServerResponse *response = request->beginChunkedResponse(
+        "image/jpeg",
+        [bufPtr, totalLen](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+          if (index >= totalLen) return 0;
+          size_t remain = totalLen - index;
+          size_t toSend = (remain < maxLen) ? remain : maxLen;
+          memcpy(buffer, bufPtr.get() + index, toSend);
+          return toSend;
+        }
+      );
+      response->addHeader("Cache-Control", "max-age=300");
+      request->send(response);
+    } else {
+      // JPEG photo: stream directly from file
+      auto fp = std::make_shared<File>();
+      bool opened = false;
+      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+        *fp = SD.open(filename, FILE_READ);
+        opened = (bool)*fp;
+        xSemaphoreGive(spiMutex);
+      }
+      if (!opened) {
+        request->send(404, "text/plain", "Not found");
+        return;
+      }
+
+      AsyncWebServerResponse *response = request->beginChunkedResponse(
+        "image/jpeg",
+        [fp](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+          if (!*fp) return 0;
+          size_t bytesRead = 0;
+          if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+            bytesRead = fp->read(buffer, maxLen);
+            if (bytesRead == 0) {
+              fp->close();
+            }
+            xSemaphoreGive(spiMutex);
+          }
+          return bytesRead;
+        }
+      );
+      // Cache thumbnails in browser for 5 min — avoid re-downloading on page reload
+      response->addHeader("Cache-Control", "max-age=300");
+      request->send(response);
+    }
   });
 
   // Route: delete file — validates SD mount
@@ -2185,6 +2247,13 @@ bool writeAVIAudioChunk(File &file, uint8_t *buf, size_t bytes) {
 }
 
 void endAVI(File &file, int fps, int width, int height) {
+  // Defensive guard: if SD was removed mid-recording, the file handle is invalid.
+  // Attempting to seek/write would crash or corrupt memory. Bail out gracefully.
+  if (!file) {
+    Serial.println("[REC] endAVI: file handle invalid (SD removed?), skipping finalization.");
+    return;
+  }
+
   unsigned long duration = millis() - avi_start_time;
   float real_fps = (float)avi_total_frames / (duration / 1000.0f);
   if (real_fps <= 0) real_fps = (float)TARGET_FPS;
@@ -2681,7 +2750,7 @@ void drawGalleryPhoto() {
     File f = SD.open(filePath, FILE_READ);
     if (f) {
       size_t fsize = f.size();
-      if (fsize <= FRAME_BUF_SIZE && jpgBuf) {
+      if (fsize <= DISP_BUF_SIZE && jpgBuf) {
         jpgLen = f.read(jpgBuf, fsize);
       }
       f.close();
@@ -2725,48 +2794,113 @@ void drawGalleryPhoto() {
   }
 }
 
-// Display a single video item with play icon and file info.
+// Extract the Nth JPEG frame from an AVI file's MOVI list.
+// Returns the JPEG data size written to buf, or 0 on failure.
+// Caller must hold spiMutex (SD file access) and ensure buf is large enough.
+size_t extractAVIFrame(File &aviFile, uint8_t *buf, size_t bufSize, int targetFrame) {
+  if (!aviFile || !buf || bufSize == 0) return 0;
+
+  aviFile.seek(avi_header_size);  // skip AVI header, enter MOVI
+
+  int videoFrameIdx = 0;
+  uint8_t tag[4];
+
+  while (aviFile.read(tag, 4) == 4) {
+    uint32_t chunkSize = 0;
+    if (aviFile.read((uint8_t*)&chunkSize, 4) != 4) break;
+
+    // Stop at idx1 marker
+    if (tag[0] == 'i' && tag[1] == 'd' && tag[2] == 'x' && tag[3] == '1') break;
+
+    // "00dc" = video frame (JPEG)
+    if (tag[0] == 0x30 && tag[1] == 0x30 && tag[2] == 0x64 && tag[3] == 0x63) {
+      if (videoFrameIdx == targetFrame && chunkSize > 0 && chunkSize <= bufSize) {
+        size_t rd = aviFile.read(buf, chunkSize);
+        return (rd == chunkSize) ? chunkSize : 0;
+      }
+      videoFrameIdx++;
+    }
+
+    // Skip this chunk's data (seek past it)
+    aviFile.seek(aviFile.position() + chunkSize);
+  }
+
+  return 0;  // target frame not found
+}
+
+// Display a single video item with thumbnail background + overlaid play icon and info.
+// Extracts frame 12 (0-indexed) from the AVI as thumbnail. Falls back to plain icon
+// if extraction fails.
 void drawGalleryVideoItem() {
   if (galleryFileCount == 0 || galleryIndex >= galleryFileCount) return;
 
   const char *filePath = galleryFiles[galleryIndex];
 
+  // Try to extract a thumbnail frame (frame 12 ≈ 1.2s into video at 10fps)
+  uint8_t *thumbBuf = dispBuf[0];  // safe — camera copy paused during gallery
+  size_t thumbLen = 0;
+  float sizeMB = 0;
+
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    File aviFile = SD.open(filePath, FILE_READ);
+    if (aviFile) {
+      sizeMB = aviFile.size() / 1048576.0f;
+      thumbLen = extractAVIFrame(aviFile, thumbBuf, DISP_BUF_SIZE, 12);
+      aviFile.close();
+    }
+    xSemaphoreGive(spiMutex);
+  }
+
   if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
     tft.fillScreen(TFT_BLACK);
     tft.setTextDatum(middle_center);
 
-    // Header: index / total
+    // Background: thumbnail or plain black
+    if (thumbLen > 0) {
+      // HVGA (480x320) at 0.5f = 240x160, centered on 320x240 screen
+      tft.drawJpg(thumbBuf, thumbLen, 40, 20, 240, 160, 0, 0, 0.5f);
+    }
+
+    // Header: index / total (top bar, on a dark strip)
+    tft.fillRect(0, 0, 320, 16, TFT_BLACK);
     tft.setTextSize(1);
     tft.setTextColor(TFT_WHITE);
     char header[32];
     snprintf(header, sizeof(header), "%d / %d", galleryIndex + 1, galleryFileCount);
-    tft.drawString(header, tft.width() / 2, 10);
+    tft.drawString(header, tft.width() / 2, 8);
 
-    // Play icon (triangle)
+    // Play icon (triangle) with dark surround for visibility
     int cx = tft.width() / 2;
-    tft.fillTriangle(cx - 20, 60, cx - 20, 120, cx + 25, 90, TFT_CYAN);
+    int cy = 100;  // center of play icon
+    // Dark circle behind play button
+    tft.fillCircle(cx + 2, cy, 32, tft.color565(0, 0, 0));
+    tft.drawCircle(cx + 2, cy, 33, tft.color565(60, 60, 60));
+    // Play triangle
+    tft.fillTriangle(cx - 12, cy - 18, cx - 12, cy + 18, cx + 20, cy, TFT_CYAN);
 
-    // Filename (strip leading /)
-    tft.setTextSize(2);
-    tft.setTextColor(TFT_WHITE);
+    // Filename on a dark background strip (strip leading /)
     const char *dispName = filePath;
     if (dispName[0] == '/') dispName++;
-    tft.drawString(dispName, tft.width() / 2, 145);
+    int nameW = strlen(dispName) * 12 + 16;  // approximate width at textSize 2
+    int nameX = (320 - nameW) / 2;
+    if (nameX < 0) nameX = 0;
+    tft.fillRect(nameX, 138, nameW, 22, tft.color565(0, 0, 0));
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString(dispName, tft.width() / 2, 149);
 
-    // File size
-    float sizeMB = 0;
-    File f = SD.open(filePath, FILE_READ);
-    if (f) {
-      sizeMB = f.size() / 1048576.0f;
-      f.close();
-    }
+    // File size on a dark background strip
     char sizeStr[16];
     snprintf(sizeStr, sizeof(sizeStr), "%.1f MB", sizeMB);
+    int sizeW = strlen(sizeStr) * 6 + 12;  // approximate width at textSize 1
+    int sizeX = (320 - sizeW) / 2;
+    tft.fillRect(sizeX, 164, sizeW, 14, tft.color565(0, 0, 0));
     tft.setTextSize(1);
     tft.setTextColor(0x7BEF);
-    tft.drawString(sizeStr, tft.width() / 2, 170);
+    tft.drawString(sizeStr, tft.width() / 2, 171);
 
     // Footer
+    tft.fillRect(0, 218, 320, 22, TFT_BLACK);
     tft.setTextSize(1);
     tft.setTextColor(0x4208);
     tft.drawString("Click:Play  Long:Back", tft.width() / 2, 225);
@@ -2874,14 +3008,27 @@ void playVideoOnTFT() {
     xSemaphoreGive(spiMutex);
   }
 
-  // Seek past AVI header — MOVI chunk data starts at offset avi_header_size (324)
+  // Read microSecPerFrame from AVI header (offset 32, 4 bytes LE) so playback
+  // speed matches the actual recording rate, even if capture FPS varied.
+  uint32_t microSecPerFrame = 0;
+  uint32_t frameTimeMs = 1000 / TARGET_FPS;  // fallback: 100ms
   if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    aviFile.seek(32);
+    if (aviFile.read((uint8_t*)&microSecPerFrame, 4) == 4 &&
+        microSecPerFrame > 0 && microSecPerFrame < 1000000) {
+      frameTimeMs = microSecPerFrame / 1000;
+      Serial.printf("[GAL] AVI microSecPerFrame=%u → %u ms/frame\n",
+                    microSecPerFrame, frameTimeMs);
+    } else {
+      Serial.printf("[GAL] Bad microSecPerFrame (%u), using default %u ms\n",
+                    microSecPerFrame, frameTimeMs);
+    }
+    // Seek to MOVI chunk data start (past header)
     aviFile.seek(avi_header_size);
     xSemaphoreGive(spiMutex);
   }
 
   uint8_t *frameBuf = dispBuf[0];  // reuse display buffer (camera copy paused)
-  uint32_t frameTimeMs = 1000 / TARGET_FPS;  // 100ms per frame
   bool paused = false;
   bool stopped = false;
   int frameNum = 0;
@@ -2923,6 +3070,7 @@ void playVideoOnTFT() {
     uint32_t chunkSize = 0;
     size_t bytesRead = 0;
     bool endOfData = false;
+    bool drewFrame = false;  // only apply frame timing after a video frame
 
     if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
       bytesRead = aviFile.read(tag, 4);
@@ -2938,11 +3086,12 @@ void playVideoOnTFT() {
       // "00dc" = video frame (JPEG)
       else if (tag[0] == 0x30 && tag[1] == 0x30 && tag[2] == 0x64 && tag[3] == 0x63) {
         unknownChunks = 0;
-        if (chunkSize > 0 && chunkSize <= FRAME_BUF_SIZE && frameBuf) {
+        if (chunkSize > 0 && chunkSize <= DISP_BUF_SIZE && frameBuf) {
           size_t rd = aviFile.read(frameBuf, chunkSize);
           if (rd == chunkSize) {
             tft.drawJpg(frameBuf, chunkSize, 40, 40, 240, 160, 0, 0, 0.5f);
             frameNum++;
+            drewFrame = true;
             // Frame counter overlay
             tft.setTextSize(1);
             tft.setTextColor(TFT_GREEN, TFT_BLACK);
@@ -2973,10 +3122,14 @@ void playVideoOnTFT() {
 
     if (endOfData) break;
 
-    // Frame timing — maintain TARGET_FPS
-    uint32_t elapsed = millis() - frameStart;
-    if (elapsed < frameTimeMs) {
-      vTaskDelay(pdMS_TO_TICKS(frameTimeMs - elapsed));
+    // Frame timing — only after rendering a video frame.
+    // Audio/unknown chunks loop back immediately with no delay so they
+    // don't double the effective per-frame interval.
+    if (drewFrame) {
+      uint32_t elapsed = millis() - frameStart;
+      if (elapsed < frameTimeMs) {
+        vTaskDelay(pdMS_TO_TICKS(frameTimeMs - elapsed));
+      }
     }
   }
 

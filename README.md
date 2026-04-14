@@ -1,6 +1,6 @@
 # XIAO ESP32-S3 Sense Retro Camera
 
-A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Sense. Captures high-resolution photos and MJPEG/PCM audio video, with a live viewfinder on a 2.0" TFT display. Features a full encoder-driven menu system with on-device gallery, camera settings, and wireless file management. Runs a multi-task FreeRTOS architecture for robust, concurrent operation.
+A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Sense. Captures high-resolution photos and MJPEG/PCM audio video, with a live viewfinder on a 2.0" TFT display. Features a full encoder-driven menu system with on-device gallery (including video thumbnail previews), camera settings, and a tabbed wireless file manager. Runs a multi-task FreeRTOS architecture for robust, concurrent operation.
 
 ---
 
@@ -13,14 +13,14 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **Camera Settings** — On-device configuration of 9 sensor parameters (brightness, contrast, saturation, AE level, white balance, special effects, mirror, flip, JPEG quality) with NVS persistence
 - **Hardware Mirroring** — Toggle horizontal flip (selfie mode) via the built-in Boot button
 - **FPS Counter & SD Status** — Live overlay showing frame rate and SD card health
-- **WiFi File Server** — AP mode with an embedded HTML file manager to download/delete assets wirelessly
-- **On-Device Gallery** — Browse photos (JPEG) and videos (AVI) on the TFT with encoder-based navigation
-- **Silent Video Playback** — Plays AVI recordings on the TFT at 10 FPS by parsing MOVI JPEG chunks; pause/resume/stop via encoder
+- **WiFi File Server** — AP mode with a tabbed HTML file manager (Photos / Videos tabs with file count badges, alphabetically sorted); download, preview, or delete assets wirelessly with video thumbnail support
+- **On-Device Gallery** — Browse photos and videos on the TFT; video items show a thumbnail preview (frame ~1.2 s into the clip) with a play button, filename, and size overlaid on dark strips
+- **Silent Video Playback** — Plays AVI recordings on the TFT by parsing MOVI JPEG chunks; frame timing derived from the AVI header's `microSecPerFrame` for accurate real-time speed; pause/resume/stop via encoder
 - **File Deletion** — Delete photos and videos directly from the device with a confirmation dialog
-- **Reliable AVI Encoding** — Accurate `idx1` index table built from actual chunk write order; `microSecPerFrame` derived from declared target FPS, not a variable end-of-recording average
+- **Reliable AVI Encoding** — Accurate `idx1` index table built from actual chunk write order; `microSecPerFrame` derived from declared target FPS; `endAVI()` safely handles SD removal mid-recording
 - **A/V Synchronisation** — I2S DMA geometry tuned to drain exactly one video frame's worth of audio per read (`AUDIO_BYTES_PER_FRAME = 3200` bytes, 10×320-byte DMA slots); fixes cumulative drift
 - **Atomic Multi-Core Synchronisation** — `std::atomic<int>` for all inter-core display-buffer state, preventing SMP data races
-- **PSRAM Efficiency** — AVI metadata arrays (frame sizes, audio sizes, chunk order) allocated once at boot and `memset` per recording session, eliminating heap fragmentation
+- **PSRAM Efficiency** — Separate `DISP_BUF_SIZE` (160 KB) and `REC_BUF_SIZE` (80 KB) buffer pools save 240 KB PSRAM; AVI metadata arrays allocated once at boot and `memset` per session
 
 ---
 
@@ -30,7 +30,7 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 |---|---|
 | Microcontroller | Seeed Studio XIAO ESP32-S3 Sense (OV2640 + SD card expansion) |
 | Display | 2.0" TFT LCD — ST7789VW, 240×320, SPI |
-| Rotary Encoder | EC11 with push button (CLK: GPIO 44, DT: GPIO 43, SW: GPIO 6) |
+| Rotary Encoder | EC11 with push button (CLK: GPIO 6, DT: GPIO 43, SW: GPIO 44) |
 | Shutter button | 1× tactile button (GPIO 4 / GPIO 5) |
 | Mirror button | Built-in Boot button (GPIO 0) |
 | Storage | MicroSD card, FAT32 formatted |
@@ -63,6 +63,9 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
         <h3>Buttons & Control</h3>
         <table>
           <tr><th>Function</th><th>GPIO</th></tr>
+          <tr><td>Encoder CLK</td><td>GPIO 6 (INPUT_PULLUP)</td></tr>
+          <tr><td>Encoder DT</td><td>GPIO 43 (INPUT_PULLUP)</td></tr>
+          <tr><td>Encoder SW (Button)</td><td>GPIO 44 (INPUT_PULLUP)</td></tr>
           <tr><td>Shutter — leg 1</td><td>GPIO 4 (OUTPUT)</td></tr>
           <tr><td>Shutter — leg 2</td><td>GPIO 5 (INPUT_PULLUP)</td></tr>
           <tr><td>Mirror toggle</td><td>GPIO 0 (Boot, built-in)</td></tr>
@@ -118,7 +121,8 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 ### WiFi File Manager
 - **Long press** the **Boot button** (> 800 ms) in Idle mode to enter WiFi AP mode
 - Connect your phone/PC to `Retro_Cam` (password: `barkinsarikartal`)
-- Navigate to `http://192.168.4.1` to download or delete files
+- Navigate to `http://192.168.4.1` — tabbed interface: **Photos** and **Videos** tabs, each sorted alphabetically with file count badges
+- Both photos and videos display thumbnail previews; video thumbnails are extracted from frame ~1.2 s into the clip
 - Press the encoder click/long or Boot long to exit WiFi mode and resume camera
 
 ### SD Card Status
@@ -136,8 +140,8 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - Select "Gallery" from the main menu → Gallery type selector (Photos / Videos)
 - **CW / CCW** to switch between types, **click** to enter
 - **In Photo Gallery:** CW/CCW to browse, click to open delete dialog (Cancel / Delete)
-- **In Video Gallery:** CW/CCW to browse, click to play video directly
-- **During Video Playback:** click to pause/resume, long press to stop → delete dialog
+- **In Video Gallery:** CW/CCW to browse; each video displays a thumbnail preview with play button, filename, and file size overlaid; click to play directly
+- **During Video Playback:** plays at accurate real-time speed (frame timing from AVI header); click to pause/resume, long press to stop → delete dialog
 - **File Deletion:** Confirmation dialog with Cancel/Delete before removing from SD
 - **Shutter button** exits any menu/gallery state immediately (emergency exit)
 
@@ -191,7 +195,7 @@ Every video frame always receives one audio chunk (zero-padded if the DMA hasn't
 
 | Task | Core | Priority | Stack | Responsibility |
 |---|---|---|---|---|
-| taskSDMonitor | 0 | 1 | 4 KB | SD health, free space, removal detection |
+| taskSDMonitor | 0 | 1 | 4 KB | SD health, free space, removal detection (skips SPI polling during recording) |
 | taskInput | 0 | 2 | 4 KB | Button/encoder debounce, menu state machine |
 | taskRecorder | 0 | 4 | 8 KB | SD write, I2S audio read, AVI chunk output |
 | taskDisplay | 1 | 3 | 16 KB | TFT frame rendering, menus, gallery UI, video playback |
