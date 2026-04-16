@@ -146,16 +146,17 @@ void drawGalleryPhoto() {
 
   const char *filePath = galleryFiles[galleryIndex];
 
-  // Read JPEG into dispBuf[0] (PSRAM, camera copy paused during gallery)
+  // Camera copy is paused in gallery states, so dispBuf[0] is free for JPEG I/O.
   uint8_t *jpgBuf = dispBuf[0];
   size_t jpgLen = 0;
+  size_t fileBytes = 0;
 
   if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
     File f = SD.open(filePath, FILE_READ);
     if (f) {
-      size_t fsize = f.size();
-      if (fsize <= DISP_BUF_SIZE && jpgBuf) {
-        jpgLen = f.read(jpgBuf, fsize);
+      fileBytes = f.size();
+      if (fileBytes <= DISP_BUF_SIZE && jpgBuf) {
+        jpgLen = f.read(jpgBuf, fileBytes);
       }
       f.close();
     }
@@ -188,7 +189,19 @@ void drawGalleryPhoto() {
       tft.drawString("Cannot display", tft.width() / 2, 120);
     }
 
-    // Footer
+    // File size
+    if (fileBytes > 0) {
+      char sizeStr[16];
+      if (fileBytes < 1024 * 1024) {
+        snprintf(sizeStr, sizeof(sizeStr), "%.1f KB", fileBytes / 1024.0f);
+      } else {
+        snprintf(sizeStr, sizeof(sizeStr), "%.1f MB", fileBytes / 1048576.0f);
+      }
+      tft.setTextSize(1);
+      tft.setTextColor(0x7BEF);
+      tft.drawString(sizeStr, tft.width() / 2, 215);
+    }
+
     tft.setTextSize(1);
     tft.setTextColor(0x4208);
     tft.drawString("Click:Delete  Long:Back", tft.width() / 2, 225);

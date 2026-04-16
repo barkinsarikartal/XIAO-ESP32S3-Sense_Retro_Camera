@@ -75,7 +75,7 @@
 #define IDLE_JPEG_QUALITY 0
 
 // ================= FIRMWARE VERSION =================
-#define FIRMWARE_VERSION "v1.2"
+#define FIRMWARE_VERSION "v1.3"
 
 // ================= WIFI AP CONFIG =================
 #define WIFI_SSID "Retro_Cam"

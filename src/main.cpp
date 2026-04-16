@@ -232,10 +232,14 @@ void allocateBuffers() {
                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
-// ================= HELPER: TFT MESSAGE =================
-// Shows a centred message on the TFT (acquires spiMutex internally).
-// If durationMs > 0, blocks the calling task for that duration.
+// Centred transient message. Pausing taskDisplay during the hold is essential
+// in IDLE — otherwise the next camera frame pushes over the text within ~40 ms
+// and the user only sees a one-frame flash of e.g. "NO SD CARD!".
 void showTFTMessage(const char *msg, uint16_t color, int durationMs) {
+  AppState saved = appState;
+  bool pauseDisplay = (durationMs > 0 && saved == STATE_IDLE);
+  if (pauseDisplay) appState = STATE_PHOTO;
+
   if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
     tft.fillRect(0, 80, 320, 60, TFT_BLACK);
     tft.setTextDatum(middle_center);
@@ -246,6 +250,8 @@ void showTFTMessage(const char *msg, uint16_t color, int durationMs) {
     xSemaphoreGive(spiMutex);
   }
   if (durationMs > 0) vTaskDelay(pdMS_TO_TICKS(durationMs));
+
+  if (pauseDisplay) appState = saved;
 }
 
 // ================= HELPER: EMERGENCY EXIT =================
@@ -424,7 +430,7 @@ static void taskInput(void *pvParameters) {
             xEventGroupSetBits(appEvents, EVT_TAKE_PHOTO);
             sendEvent(INPUT_BTN_SHORT);
           } else {
-            showTFTMessage(errMsg.c_str(), TFT_RED, 1000);
+            showTFTMessage(errMsg.c_str(), TFT_RED, 2000);
           }
         } else if (appState == STATE_RECORDING && millis() - recordingStartTime > 2000) {
           // Stop recording
@@ -482,7 +488,7 @@ static void taskInput(void *pvParameters) {
           }
           shutterPressTime = 0;  // re-arm
         } else {
-          showTFTMessage(errorMsg.c_str(), TFT_RED, 1000);
+          showTFTMessage(errorMsg.c_str(), TFT_RED, 2000);
           shutterPressTime = 0;
         }
       }
@@ -503,7 +509,6 @@ static void taskInput(void *pvParameters) {
               // Menu is always accessible regardless of SD state.
               // SD checks happen per-item (Gallery, WiFi) inside STATE_MENU_MAIN.
               menuMainSelection = 0;
-              galleryNeedsRedraw = true;
               enterMenuMain();
             }
             break;
@@ -521,7 +526,7 @@ static void taskInput(void *pvParameters) {
               switch (menuMainSelection) {
                 case 0: // Gallery — requires SD
                   if (!globalSDState.isMounted) {
-                    showTFTMessage("SD REQUIRED!", TFT_RED, 1500);
+                    showTFTMessage("SD REQUIRED!", TFT_RED, 2000);
                     galleryNeedsRedraw = true;
                     if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                     break;
@@ -533,7 +538,7 @@ static void taskInput(void *pvParameters) {
                   break;
                 case 1: // WiFi — requires SD
                   if (!globalSDState.isMounted) {
-                    showTFTMessage("SD REQUIRED!", TFT_RED, 1500);
+                    showTFTMessage("SD REQUIRED!", TFT_RED, 2000);
                     galleryNeedsRedraw = true;
                     if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                     break;
@@ -549,7 +554,7 @@ static void taskInput(void *pvParameters) {
                   break;
                 case 3: // Timelapse — requires SD
                   if (!globalSDState.isMounted) {
-                    showTFTMessage("SD REQUIRED!", TFT_RED, 1500);
+                    showTFTMessage("SD REQUIRED!", TFT_RED, 2000);
                     galleryNeedsRedraw = true;
                     if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                     break;
@@ -1321,10 +1326,13 @@ static void taskRecorder(void *pvParameters) {
             writeAVIAudioChunk(videoFile, (uint8_t*)audioRecBuf, audio_bytes_read);
           }
           if (!ok) {
-            Serial.println("Write error! Requesting recording stop.");
+            // Write failure here means SD is gone or full. Route through EVT_SD_STOP
+            // so the stop handler shows the error branch ("REC STOPPED / SD REMOVED")
+            // instead of the success "VIDEO SAVED" path.
+            Serial.println("Write error! Requesting recording stop (SD lost).");
             xSemaphoreGive(spiMutex);
             xSemaphoreGive(recPoolFree);
-            xEventGroupSetBits(appEvents, EVT_STOP_RECORDING);
+            xEventGroupSetBits(appEvents, EVT_SD_STOP);
             while (appState == STATE_RECORDING) {
               vTaskDelay(pdMS_TO_TICKS(10));
             }
@@ -1742,6 +1750,9 @@ static void runTimelapse() {
 // Enter main menu from IDLE: deinit camera, set state, trigger redraw.
 // Camera is powered down during menu navigation to free PSRAM and reduce power.
 void enterMenuMain() {
+  // Suppress any pending redraw — taskDisplay would otherwise race us during
+  // the deinit delay, paint the menu, then get wiped by our fillScreen below.
+  galleryNeedsRedraw = false;
   appState = STATE_MENU_MAIN;
   vTaskDelay(pdMS_TO_TICKS(150));
   esp_camera_deinit();
@@ -1750,6 +1761,7 @@ void enterMenuMain() {
     tft.fillScreen(TFT_BLACK);
     xSemaphoreGive(spiMutex);
   }
+  galleryNeedsRedraw = true;
   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
 }
 
