@@ -25,7 +25,7 @@ volatile AppState appState = STATE_IDLE;
 EventGroupHandle_t appEvents;
 QueueHandle_t inputEventQueue = NULL;
 SDStatus globalSDState = {false, false, "NO CARD"};
-CameraSettings camSettings = { 1, 0, 2, 0, 0, 0, 1, 0, 12, 10, 0 };
+CameraSettings camSettings = { 1, 0, 2, 0, 0, 0, 1, 0, 12, 10, 0, 0 };
 camera_config_t config;
 int pictureNumber = 0;
 int videoNumber = 0;
@@ -104,9 +104,13 @@ void setup() {
   esp_bt_controller_disable();
 
   // Boot button (GPIO 0) no longer used — mirror and WiFi are in encoder menu.
-  pinMode(SHUTTER_BTN_PIN_1, OUTPUT);
   pinMode(SHUTTER_BTN_PIN_2, INPUT_PULLUP);
-  digitalWrite(SHUTTER_BTN_PIN_1, LOW);
+
+  // LED flashlight output (GPIO4). Starts in the state saved by NVS.
+  // camSettings.flashlight_on is loaded later in loadCameraSettings(),
+  // so we initialise LOW here and apply the saved state after load.
+  pinMode(LED_FLASHLIGHT_PIN, OUTPUT);
+  digitalWrite(LED_FLASHLIGHT_PIN, LOW);
 
   pinMode(ENC_CLK, INPUT_PULLUP);
   pinMode(ENC_DT,  INPUT_PULLUP);
@@ -147,6 +151,9 @@ void setup() {
 
   // Load camera settings from NVS
   loadCameraSettings();
+
+  // Apply saved flashlight state now that NVS values are loaded
+  digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? HIGH : LOW);
 
   Serial.printf("Initial image no: %d, video no: %d\n", pictureNumber, videoNumber);
 
@@ -749,8 +756,8 @@ static void taskInput(void *pvParameters) {
             } else {
               // Editing mode: CW/CCW adjust value, CLICK confirms
 
-              // Special case: counter reset (index 11) — action-type setting
-              if (settingsIndex == 11) {
+              // Special case: counter reset (index 12) — action-type setting
+              if (settingsIndex == 12) {
                 if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
                   resetCounterConfirm = 1 - resetCounterConfirm;
                   galleryNeedsRedraw = true;
@@ -823,6 +830,7 @@ static void taskInput(void *pvParameters) {
                 case 8: val = &camSettings.jpeg_quality;  lo = 4;  hi = 63; break;
                 case 9: val = &camSettings.timelapse_interval; break;
                 case 10: val = &camSettings.rec_max_seconds;  break;
+                case 11: val = &camSettings.flashlight_on; lo = 0; hi = 1; break;
               }
               if (val) {
                 if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
@@ -846,18 +854,30 @@ static void taskInput(void *pvParameters) {
                     if (cw) { if (*val < hi) (*val)++; }
                     else { if (*val > lo) (*val)--; }
                   }
+                  // Drive the LED immediately for live preview while editing
+                  if (settingsIndex == 11) {
+                    digitalWrite(LED_FLASHLIGHT_PIN, *val ? HIGH : LOW);
+                  }
                   galleryNeedsRedraw = true;
                   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                 } else if (ev.type == INPUT_ENC_CLICK) {
                   // Confirm edit — save to NVS immediately
                   settingsEditing = false;
                   saveCameraSettings();
+                  // Apply the flashlight GPIO state on confirm
+                  if (settingsIndex == 11) {
+                    digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? HIGH : LOW);
+                  }
                   galleryNeedsRedraw = true;
                   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                 } else if (ev.type == INPUT_ENC_LONG) {
                   // Cancel edit — revert to saved
                   loadCameraSettings();
                   settingsEditing = false;
+                  // Revert LED to saved state on cancel
+                  if (settingsIndex == 11) {
+                    digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? HIGH : LOW);
+                  }
                   galleryNeedsRedraw = true;
                   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                 }
@@ -1059,6 +1079,9 @@ static void taskCapture(void *pvParameters) {
       vTaskDelay(pdMS_TO_TICKS(50)); // let recorder finish last write
 
       deinitMicrophone();
+
+      // Restore LED to the user's flashlight setting (stops blink/video-light mode)
+      digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? HIGH : LOW);
 
       // close AVI file
       if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
@@ -1299,10 +1322,32 @@ static void drawStatusBar(float fps) {
 
 // ================= TASK: AVI RECORDER (Core 0, Priority 4) =================
 static void taskRecorder(void *pvParameters) {
+  // LED blink state for recording indicator.
+  // When flashlight_on == 0: blink at 1 Hz (500 ms on, 500 ms off).
+  // When flashlight_on == 1: LED stays on as a continuous video light.
+  unsigned long lastLedToggle = 0;
+  bool ledBlinkState = false;
+
   while (true) {
     if (appState != STATE_RECORDING && appState != STATE_STOPPING) {
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
+    }
+
+    // ── Recording LED indicator ──
+    if (appState == STATE_RECORDING) {
+      if (camSettings.flashlight_on) {
+        // Video light mode: keep LED on at all times
+        digitalWrite(LED_FLASHLIGHT_PIN, HIGH);
+      } else {
+        // No flashlight: blink at 1 Hz as a recording indicator
+        unsigned long now = millis();
+        if (now - lastLedToggle >= 500) {
+          lastLedToggle = now;
+          ledBlinkState = !ledBlinkState;
+          digitalWrite(LED_FLASHLIGHT_PIN, ledBlinkState ? HIGH : LOW);
+        }
+      }
     }
 
     RecFrame rf;
@@ -1336,6 +1381,10 @@ static void taskRecorder(void *pvParameters) {
             while (appState == STATE_RECORDING) {
               vTaskDelay(pdMS_TO_TICKS(10));
             }
+            // Restore LED to user's flashlight setting on error exit
+            digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? HIGH : LOW);
+            lastLedToggle = 0;
+            ledBlinkState = false;
             continue;
           }
         }

@@ -27,8 +27,12 @@
 // Mirror toggle and WiFi entry are accessible via encoder menu.
 #define SD_CS_PIN         21
 
-#define SHUTTER_BTN_PIN_1 4
 #define SHUTTER_BTN_PIN_2 5
+
+// LED flashlight: GPIO4 was previously used as a software GND for the shutter
+// button (the perfboard had no spare GND pads). The shutter leg has been rewired
+// to board GND, freeing GPIO4 for 2× white LEDs with 100Ω resistors (~6 mA).
+#define LED_FLASHLIGHT_PIN 4
 
 #define TFT_CS            1
 #define TFT_DC            2
@@ -75,7 +79,7 @@
 #define IDLE_JPEG_QUALITY 0
 
 // ================= FIRMWARE VERSION =================
-#define FIRMWARE_VERSION "v1.3"
+#define FIRMWARE_VERSION "v1.4"
 
 // ================= WIFI AP CONFIG =================
 #define WIFI_SSID "Retro_Cam"
@@ -118,7 +122,7 @@
 
 // ================= MENU =================
 #define MENU_MAIN_ITEMS 5
-#define SETTINGS_COUNT  12
+#define SETTINGS_COUNT  13
 
 // ================= APP STATE & EVENTS =================
 enum AppState {
@@ -175,6 +179,7 @@ struct CameraSettings {
   int jpeg_quality;        // 4=Max..63=Low, inverse scale (default: 12)
   int timelapse_interval;  // seconds between captures (default: 10)
   int rec_max_seconds;     // 0=unlimited, >0=auto-stop after N seconds (default: 0)
+  int flashlight_on;       // 0=off, 1=on (default: 0) — GPIO4 LED output
 };
 
 typedef struct { int idx; size_t len; } RecFrame;

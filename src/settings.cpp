@@ -14,6 +14,7 @@ void loadCameraSettings() {
   camSettings.jpeg_quality  = p.getInt("jpgq",  12);
   camSettings.timelapse_interval = p.getInt("tlint", 10);
   camSettings.rec_max_seconds    = p.getInt("reclim", 0);
+  camSettings.flashlight_on      = p.getInt("flash", 0);
   p.end();
   Serial.println("[NVS] Camera settings loaded.");
 }
@@ -32,6 +33,7 @@ void saveCameraSettings() {
   p.putInt("jpgq",   camSettings.jpeg_quality);
   p.putInt("tlint",  camSettings.timelapse_interval);
   p.putInt("reclim", camSettings.rec_max_seconds);
+  p.putInt("flash",  camSettings.flashlight_on);
   p.end();
   Serial.println("[NVS] Camera settings saved.");
 }
@@ -111,7 +113,7 @@ void drawSettingsMenu() {
   static const char* const names[SETTINGS_COUNT] = {
     "Bright", "Contr", "Satur", "AE Lv",
     "WB", "FX", "Mirror", "Flip", "JPEG Q",
-    "TL Int", "Rec Lim", "Rst Cnt"
+    "TL Int", "Rec Lim", "Light", "Rst Cnt"
   };
   static const char* const wbLabels[] = {
     "Auto", "Sunny", "Cloud", "Office", "Home"
@@ -125,7 +127,7 @@ void drawSettingsMenu() {
     camSettings.ae_level, camSettings.wb_mode, camSettings.special_effect,
     camSettings.hmirror, camSettings.vflip, camSettings.jpeg_quality,
     camSettings.timelapse_interval, camSettings.rec_max_seconds,
-    resetCounterConfirm
+    camSettings.flashlight_on, resetCounterConfirm
   };
 
   if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
@@ -164,7 +166,8 @@ void drawSettingsMenu() {
 
       tft.setTextDatum(middle_right);
       char valBuf[16];
-      if (i == 11) {
+      if (i == 12) {
+        // Reset counters — action-type setting
         if (editing) {
           snprintf(valBuf, sizeof(valBuf), "%s", vals[i] ? "YES" : "No");
         } else {
@@ -174,7 +177,8 @@ void drawSettingsMenu() {
         snprintf(valBuf, sizeof(valBuf), "%s", wbLabels[constrain(vals[i], 0, 4)]);
       } else if (i == 5) {
         snprintf(valBuf, sizeof(valBuf), "%s", fxLabels[constrain(vals[i], 0, 6)]);
-      } else if (i == 6 || i == 7) {
+      } else if (i == 6 || i == 7 || i == 11) {
+        // Mirror, Flip, Light — on/off toggles
         snprintf(valBuf, sizeof(valBuf), "%s", vals[i] ? "On" : "Off");
       } else if (i == 9 || i == 10) {
         if (i == 10 && vals[i] == 0) {
