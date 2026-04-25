@@ -79,7 +79,7 @@
 #define IDLE_JPEG_QUALITY 0
 
 // ================= FIRMWARE VERSION =================
-#define FIRMWARE_VERSION "v1.5"
+#define FIRMWARE_VERSION "v1.6"
 
 // ================= WIFI AP CONFIG =================
 #define WIFI_SSID "Retro_Cam"
@@ -120,6 +120,13 @@
 #define GALLERY_MAX_FILES  2000
 #define GALLERY_NAME_LEN   24
 
+// Grid gallery layout (320×240 landscape)
+#define GRID_COLS           4
+#define GRID_ROWS           3
+#define GRID_ITEMS_PER_PAGE (GRID_COLS * GRID_ROWS)   // 12
+#define THUMB_W            70
+#define THUMB_H            52
+
 // ================= MENU =================
 #define MENU_MAIN_ITEMS 5
 #define SETTINGS_COUNT  13
@@ -132,8 +139,10 @@ enum AppState {
   STATE_STOPPING,
   STATE_MENU_MAIN,
   STATE_GALLERY_TYPE,
-  STATE_GALLERY_PHOTOS,
-  STATE_GALLERY_VIDEOS,
+  STATE_GALLERY_PHOTOS,       // photo grid view (4×3 thumbnails)
+  STATE_GALLERY_VIDEOS,       // video grid view (4×3 thumbnails)
+  STATE_GALLERY_PHOTO_VIEW,   // single-photo detail view (from grid click)
+  STATE_GALLERY_VIDEO_VIEW,   // single-video detail view (from grid click)
   STATE_VIDEO_PLAYING,
   STATE_DELETE_CONFIRM,
   STATE_WIFI_MODE,
@@ -255,6 +264,7 @@ extern int galleryIndex;
 extern int galleryTypeSelection;
 extern int deleteSelection;
 extern volatile bool galleryNeedsRedraw;
+extern int gridPage;           // current grid page (0-indexed)
 
 // Menu state
 extern int menuMainSelection;
@@ -304,11 +314,15 @@ void stopWiFiMode();
 void scanGalleryFiles(bool videosOnly);
 void freeGalleryFiles();
 void drawGalleryTypeMenu();
-void drawGalleryPhoto();
-void drawGalleryVideoItem();
+void drawPhotoGrid();
+void drawVideoGrid();
+void drawGalleryPhotoView();
+void drawGalleryVideoView();
 size_t extractAVIFrame(File &aviFile, uint8_t *buf, size_t bufSize, int targetFrame);
 void drawDeleteConfirm();
 void playVideoOnTFT();
+void drawGridCursor(int col, int row, uint16_t color);
+void clearGridCursor(int col, int row);
 
 // ================= FUNCTION PROTOTYPES — settings.cpp =================
 void loadCameraSettings();

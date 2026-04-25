@@ -16,7 +16,7 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **LED Flashlight & Recording Indicator** — General-purpose LED flashlight that also acts as a 1 Hz blinking recording indicator or continuous video light
 - **FPS Counter & SD Status** — Live overlay showing frame rate and SD card health
 - **WiFi File Server** — AP mode with a tabbed HTML file manager (Photos / Videos tabs with file count badges, sorted newest-first); download with browser progress bar, preview, delete individual files, **bulk-select and delete multiple files**, or **delete all** photos/videos in one tap; video thumbnail support
-- **On-Device Gallery** — Browse photos and videos on the TFT; video items show a thumbnail preview (frame ~1.2 s into the clip) with a play button, filename, and size overlaid on dark strips
+- **On-Device Gallery** — Browse photos and videos in a **4×3 thumbnail grid** (12 items per page); drill into a full-screen detail view with encoder click; video thumbnails show a play icon overlay; page indicator shows current position
 - **Silent Video Playback** — Plays AVI recordings on the TFT by parsing MOVI JPEG chunks; frame timing derived from the AVI header's `microSecPerFrame` for accurate real-time speed; pause/resume/stop via encoder
 - **File Deletion** — Delete photos and videos directly from the device with a confirmation dialog
 - **Reliable AVI Encoding** — Accurate `idx1` index table built from actual chunk write order; `microSecPerFrame` derived from declared target FPS; `endAVI()` safely handles SD removal mid-recording
@@ -141,10 +141,15 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 ### Gallery (Photos & Videos)
 - Select "Gallery" from the main menu → Gallery type selector (Photos / Videos)
 - **CW / CCW** to switch between types, **click** to enter
-- **In Photo Gallery:** CW/CCW to browse, click to open delete dialog (Cancel / Delete)
-- **In Video Gallery:** CW/CCW to browse; each video displays a thumbnail preview with play button, filename, and file size overlaid; click to play directly
+- **Grid View (4×3 thumbnails):**
+  - CW/CCW to move cursor between cells; wraps to next/previous page automatically
+  - Page indicator in header shows "Photos 2/5" or "Videos 1/3"
+  - **Click** to drill down to the full-screen detail view
+  - **Long press** to go back to gallery type selector
+- **Photo Detail View:** shows full-size photo (1280×720 scaled), filename, file size; CW/CCW to browse photos; click → delete dialog; long press → back to grid
+- **Video Detail View:** shows thumbnail + play icon + filename + file size; CW/CCW to browse; click → play video; long press → back to grid
 - **During Video Playback:** plays at accurate real-time speed (frame timing from AVI header); click to pause/resume, long press to stop → delete dialog
-- **File Deletion:** Confirmation dialog with Cancel/Delete before removing from SD
+- **File Deletion:** Confirmation dialog with Cancel/Delete before removing from SD; after deletion returns to grid view
 - **Shutter button** exits any menu/gallery state immediately (emergency exit)
 
 ### Camera Settings
@@ -257,8 +262,8 @@ Components are soldered on perfboard, powered by a 3.7 V 18650 Li-ion cell.
 | Viewfinder FPS | 15–25 FPS |
 | Photo save time | 3–5 seconds |
 | Video recording FPS | 9–10 FPS |
-| RAM usage | ~17.9% of 320 KB |
-| Flash usage | ~37.8% of 3.3 MB |
+| RAM usage | ~18.0% of 320 KB |
+| Flash usage | ~38.2% of 3.3 MB |
 
 ---
 

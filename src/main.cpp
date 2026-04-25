@@ -450,7 +450,8 @@ static void taskInput(void *pvParameters) {
         } else if (appState == STATE_MENU_MAIN || appState == STATE_SETTINGS ||
                    appState == STATE_GALLERY_TYPE || appState == STATE_GALLERY_PHOTOS ||
                    appState == STATE_GALLERY_VIDEOS || appState == STATE_DELETE_CONFIRM ||
-                   appState == STATE_VIDEO_PLAYING) {
+                   appState == STATE_VIDEO_PLAYING ||
+                   appState == STATE_GALLERY_PHOTO_VIEW || appState == STATE_GALLERY_VIDEO_VIEW) {
           // Emergency exit from any gallery/menu state -> IDLE
           emergencyExitToIdle();
         }
@@ -469,7 +470,8 @@ static void taskInput(void *pvParameters) {
       bool isMenu = (cs == STATE_MENU_MAIN || cs == STATE_SETTINGS ||
                      cs == STATE_GALLERY_TYPE || cs == STATE_GALLERY_PHOTOS ||
                      cs == STATE_GALLERY_VIDEOS || cs == STATE_DELETE_CONFIRM ||
-                     cs == STATE_VIDEO_PLAYING);
+                     cs == STATE_VIDEO_PLAYING ||
+                     cs == STATE_GALLERY_PHOTO_VIEW || cs == STATE_GALLERY_VIDEO_VIEW);
       if (shutterNow == LOW && (cs == STATE_IDLE || isMenu) &&
           (millis() - shutterPressTime > 1000) && shutterPressTime != 0) {
         // Exit menu/gallery first if needed
@@ -603,6 +605,7 @@ static void taskInput(void *pvParameters) {
               scanGalleryFiles(galleryTypeSelection == 1);
               if (galleryFileCount > 0) {
                 galleryIndex = 0;
+                gridPage = 0;
                 galleryNeedsRedraw = true;
                 appState = (galleryTypeSelection == 0) ? STATE_GALLERY_PHOTOS : STATE_GALLERY_VIDEOS;
               } else {
@@ -626,7 +629,45 @@ static void taskInput(void *pvParameters) {
             }
             break;
 
-          case STATE_GALLERY_PHOTOS:
+          case STATE_GALLERY_PHOTOS: {
+            // Grid view: cursor moves between cells, page changes trigger full redraw
+            if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
+              int oldIdx = galleryIndex;
+              int oldPage = gridPage;
+              if (ev.type == INPUT_ENC_CW && galleryIndex < galleryFileCount - 1) {
+                galleryIndex++;
+              } else if (ev.type == INPUT_ENC_CCW && galleryIndex > 0) {
+                galleryIndex--;
+              }
+              gridPage = galleryIndex / GRID_ITEMS_PER_PAGE;
+              if (gridPage != oldPage) {
+                // Page changed — full grid redraw
+                galleryNeedsRedraw = true;
+                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+              } else if (galleryIndex != oldIdx) {
+                // Same page — just move the cursor border
+                int pageStart = gridPage * GRID_ITEMS_PER_PAGE;
+                int oldLocal = oldIdx - pageStart;
+                int newLocal = galleryIndex - pageStart;
+                clearGridCursor(oldLocal % GRID_COLS, oldLocal / GRID_COLS);
+                drawGridCursor(newLocal % GRID_COLS, newLocal / GRID_COLS, TFT_CYAN);
+              }
+            } else if (ev.type == INPUT_ENC_CLICK) {
+              // Drill down to detail view
+              galleryNeedsRedraw = true;
+              appState = STATE_GALLERY_PHOTO_VIEW;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            } else if (ev.type == INPUT_ENC_LONG) {
+              freeGalleryFiles();
+              galleryNeedsRedraw = true;
+              appState = STATE_GALLERY_TYPE;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            }
+            break;
+          }
+
+          case STATE_GALLERY_PHOTO_VIEW:
+            // Detail view: CW/CCW = prev/next, CLICK = delete, LONG = back to grid
             if (ev.type == INPUT_ENC_CW) {
               if (galleryIndex < galleryFileCount - 1) {
                 galleryIndex++;
@@ -645,14 +686,51 @@ static void taskInput(void *pvParameters) {
               appState = STATE_DELETE_CONFIRM;
               if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
             } else if (ev.type == INPUT_ENC_LONG) {
+              // Return to grid, update gridPage to match current index
+              gridPage = galleryIndex / GRID_ITEMS_PER_PAGE;
+              galleryNeedsRedraw = true;
+              appState = STATE_GALLERY_PHOTOS;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            }
+            break;
+
+          case STATE_GALLERY_VIDEOS: {
+            // Video grid view
+            if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
+              int oldIdx = galleryIndex;
+              int oldPage = gridPage;
+              if (ev.type == INPUT_ENC_CW && galleryIndex < galleryFileCount - 1) {
+                galleryIndex++;
+              } else if (ev.type == INPUT_ENC_CCW && galleryIndex > 0) {
+                galleryIndex--;
+              }
+              gridPage = galleryIndex / GRID_ITEMS_PER_PAGE;
+              if (gridPage != oldPage) {
+                galleryNeedsRedraw = true;
+                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+              } else if (galleryIndex != oldIdx) {
+                int pageStart = gridPage * GRID_ITEMS_PER_PAGE;
+                int oldLocal = oldIdx - pageStart;
+                int newLocal = galleryIndex - pageStart;
+                clearGridCursor(oldLocal % GRID_COLS, oldLocal / GRID_COLS);
+                drawGridCursor(newLocal % GRID_COLS, newLocal / GRID_COLS, TFT_CYAN);
+              }
+            } else if (ev.type == INPUT_ENC_CLICK) {
+              // Drill down to video detail view
+              galleryNeedsRedraw = true;
+              appState = STATE_GALLERY_VIDEO_VIEW;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            } else if (ev.type == INPUT_ENC_LONG) {
               freeGalleryFiles();
               galleryNeedsRedraw = true;
               appState = STATE_GALLERY_TYPE;
               if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
             }
             break;
+          }
 
-          case STATE_GALLERY_VIDEOS:
+          case STATE_GALLERY_VIDEO_VIEW:
+            // Video detail view: CW/CCW = prev/next, CLICK = play, LONG = back to grid
             if (ev.type == INPUT_ENC_CW) {
               if (galleryIndex < galleryFileCount - 1) {
                 galleryIndex++;
@@ -666,14 +744,13 @@ static void taskInput(void *pvParameters) {
                 if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
               }
             } else if (ev.type == INPUT_ENC_CLICK) {
-              // Play video directly
               appState = STATE_VIDEO_PLAYING;
               galleryNeedsRedraw = true;
               if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
             } else if (ev.type == INPUT_ENC_LONG) {
-              freeGalleryFiles();
+              gridPage = galleryIndex / GRID_ITEMS_PER_PAGE;
               galleryNeedsRedraw = true;
-              appState = STATE_GALLERY_TYPE;
+              appState = STATE_GALLERY_VIDEOS;
               if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
             }
             break;
@@ -705,8 +782,9 @@ static void taskInput(void *pvParameters) {
                   galleryFileCount--;
                   if (galleryIndex >= galleryFileCount && galleryIndex > 0) galleryIndex--;
                 }
-                // Return to gallery or type menu if empty
+                // Return to grid view (or type selector if empty)
                 if (galleryFileCount > 0) {
+                  gridPage = galleryIndex / GRID_ITEMS_PER_PAGE;
                   appState = (galleryTypeSelection == 0) ? STATE_GALLERY_PHOTOS : STATE_GALLERY_VIDEOS;
                 } else {
                   freeGalleryFiles();
@@ -716,13 +794,13 @@ static void taskInput(void *pvParameters) {
                 if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
               } else {
                 // Photos: "Cancel" selected (deleteSelection == 0)
-                appState = STATE_GALLERY_PHOTOS;
+                appState = STATE_GALLERY_PHOTO_VIEW;
                 galleryNeedsRedraw = true;
                 if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
               }
             } else if (ev.type == INPUT_ENC_LONG) {
-              // Cancel — go back
-              appState = (galleryTypeSelection == 0) ? STATE_GALLERY_PHOTOS : STATE_GALLERY_VIDEOS;
+              // Cancel — go back to detail view
+              appState = (galleryTypeSelection == 0) ? STATE_GALLERY_PHOTO_VIEW : STATE_GALLERY_VIDEO_VIEW;
               galleryNeedsRedraw = true;
               if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
             }
@@ -973,7 +1051,8 @@ static void taskCapture(void *pvParameters) {
       if (cs == STATE_WIFI_MODE || cs == STATE_MENU_MAIN || cs == STATE_SETTINGS ||
           cs == STATE_GALLERY_TYPE || cs == STATE_GALLERY_PHOTOS ||
           cs == STATE_GALLERY_VIDEOS || cs == STATE_DELETE_CONFIRM ||
-          cs == STATE_VIDEO_PLAYING || cs == STATE_TIMELAPSE) {
+          cs == STATE_VIDEO_PLAYING || cs == STATE_TIMELAPSE ||
+          cs == STATE_GALLERY_PHOTO_VIEW || cs == STATE_GALLERY_VIDEO_VIEW) {
         camWdgLastReset = 0;  // not in IDLE — reset timer when we return
         vTaskDelay(pdMS_TO_TICKS(100));
         continue;
@@ -1203,16 +1282,19 @@ static void taskDisplay(void *pvParameters) {
     // Menu and gallery states — render on demand, skip camera preview
     if (appState == STATE_MENU_MAIN || appState == STATE_SETTINGS ||
         appState == STATE_GALLERY_TYPE || appState == STATE_GALLERY_PHOTOS ||
-        appState == STATE_GALLERY_VIDEOS || appState == STATE_DELETE_CONFIRM) {
+        appState == STATE_GALLERY_VIDEOS || appState == STATE_DELETE_CONFIRM ||
+        appState == STATE_GALLERY_PHOTO_VIEW || appState == STATE_GALLERY_VIDEO_VIEW) {
       if (galleryNeedsRedraw) {
         galleryNeedsRedraw = false;
         switch (appState) {
-          case STATE_MENU_MAIN:      drawMenuMain(); break;
-          case STATE_SETTINGS:       drawSettingsMenu(); break;
-          case STATE_GALLERY_TYPE:   drawGalleryTypeMenu(); break;
-          case STATE_GALLERY_PHOTOS: drawGalleryPhoto(); break;
-          case STATE_GALLERY_VIDEOS: drawGalleryVideoItem(); break;
-          case STATE_DELETE_CONFIRM: drawDeleteConfirm(); break;
+          case STATE_MENU_MAIN:           drawMenuMain(); break;
+          case STATE_SETTINGS:            drawSettingsMenu(); break;
+          case STATE_GALLERY_TYPE:        drawGalleryTypeMenu(); break;
+          case STATE_GALLERY_PHOTOS:      drawPhotoGrid(); break;
+          case STATE_GALLERY_VIDEOS:      drawVideoGrid(); break;
+          case STATE_GALLERY_PHOTO_VIEW:  drawGalleryPhotoView(); break;
+          case STATE_GALLERY_VIDEO_VIEW:  drawGalleryVideoView(); break;
+          case STATE_DELETE_CONFIRM:      drawDeleteConfirm(); break;
           default: break;
         }
       }

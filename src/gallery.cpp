@@ -94,6 +94,199 @@ void freeGalleryFiles() {
   galleryIndex = 0;
 }
 
+// Grid page index (0-indexed). Reset on gallery entry.
+int gridPage = 0;
+
+// Helper: render one thumbnail cell at grid position (col, row).
+// Reads file from SD, decodes JPEG to TFT with clipping.
+// For videos, extracts frame 12 from AVI. Draws placeholder on failure.
+// Caller must NOT hold spiMutex — this function acquires it internally.
+static void renderThumbCell(int col, int row, int fileIdx, bool isVideo) {
+  // Cell geometry: 4px outer padding, 4px gap between cells
+  // Total grid width = 4 + 4*70 + 3*4 + 4 = 300, centered in 320 -> x_offset=10
+  // Total grid height = 22 + 4 + 3*52 + 2*4 + 4 = 194 (header 22px)
+  int x = 10 + col * (THUMB_W + 4);
+  int y = 22 + row * (THUMB_H + 4);
+
+  uint8_t *buf = dispBuf[0];
+  size_t jpgLen = 0;
+
+  if (fileIdx < galleryFileCount && buf) {
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+      if (isVideo) {
+        File f = SD.open(galleryFiles[fileIdx], FILE_READ);
+        if (f) {
+          jpgLen = extractAVIFrame(f, buf, DISP_BUF_SIZE, 12);
+          f.close();
+        }
+      } else {
+        File f = SD.open(galleryFiles[fileIdx], FILE_READ);
+        if (f) {
+          size_t sz = f.size();
+          if (sz <= DISP_BUF_SIZE) jpgLen = f.read(buf, sz);
+          f.close();
+        }
+      }
+      xSemaphoreGive(spiMutex);
+    }
+  }
+
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    if (jpgLen > 0) {
+      // Scale: photos are 1280x720 (1/16 = 80x45), videos are 480x320 (1/8 = 60x40)
+      // Use drawJpg with clip rect to fill the THUMB_W x THUMB_H cell
+      if (isVideo) {
+        tft.drawJpg(buf, jpgLen, x, y, THUMB_W, THUMB_H, 0, 0, 0.15f);
+      } else {
+        tft.drawJpg(buf, jpgLen, x, y, THUMB_W, THUMB_H, 0, 0, 0.055f);
+      }
+    } else {
+      // Placeholder: dark grey cell with icon
+      tft.fillRect(x, y, THUMB_W, THUMB_H, tft.color565(30, 30, 30));
+      tft.setTextDatum(middle_center);
+      tft.setTextSize(1);
+      tft.setTextColor(0x4208);
+      tft.drawString(isVideo ? "VID" : "IMG", x + THUMB_W / 2, y + THUMB_H / 2);
+      tft.setTextDatum(top_left);
+    }
+
+    // Video play icon overlay (small triangle)
+    if (isVideo && jpgLen > 0) {
+      int cx = x + THUMB_W / 2;
+      int cy = y + THUMB_H / 2;
+      tft.fillCircle(cx, cy, 10, tft.color565(0, 0, 0));
+      tft.fillTriangle(cx - 4, cy - 6, cx - 4, cy + 6, cx + 7, cy, TFT_CYAN);
+    }
+    xSemaphoreGive(spiMutex);
+  }
+}
+
+// Helper: draw selection border around cursor cell.
+void drawGridCursor(int col, int row, uint16_t color) {
+  int x = 10 + col * (THUMB_W + 4);
+  int y = 22 + row * (THUMB_H + 4);
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.drawRect(x - 1, y - 1, THUMB_W + 2, THUMB_H + 2, color);
+    tft.drawRect(x - 2, y - 2, THUMB_W + 4, THUMB_H + 4, color);
+    xSemaphoreGive(spiMutex);
+  }
+}
+
+// Helper: clear selection border by drawing black over it.
+void clearGridCursor(int col, int row) {
+  drawGridCursor(col, row, TFT_BLACK);
+}
+
+// Render the full photo grid page. Shows "Loading..." then decodes all thumbnails.
+void drawPhotoGrid() {
+  if (galleryFileCount == 0) return;
+
+  int totalPages = (galleryFileCount + GRID_ITEMS_PER_PAGE - 1) / GRID_ITEMS_PER_PAGE;
+  if (gridPage >= totalPages) gridPage = totalPages - 1;
+  if (gridPage < 0) gridPage = 0;
+  int pageStart = gridPage * GRID_ITEMS_PER_PAGE;
+
+  // Loading screen
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(middle_center);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawString("Loading thumbnails...", tft.width() / 2, 120);
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+
+  // Clear screen for grid
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    xSemaphoreGive(spiMutex);
+  }
+
+  // Render each thumbnail cell
+  for (int i = 0; i < GRID_ITEMS_PER_PAGE; i++) {
+    int fileIdx = pageStart + i;
+    if (fileIdx >= galleryFileCount) break;
+    int col = i % GRID_COLS;
+    int row = i / GRID_COLS;
+    renderThumbCell(col, row, fileIdx, false);
+  }
+
+  // Header: page indicator
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.setTextDatum(middle_center);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_CYAN);
+    char hdr[32];
+    snprintf(hdr, sizeof(hdr), "Photos  %d/%d", gridPage + 1, totalPages);
+    tft.drawString(hdr, tft.width() / 2, 10);
+
+    // Footer
+    tft.setTextColor(0x4208);
+    tft.drawString("Turn:Move  Click:View  Long:Back", tft.width() / 2, 232);
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+
+  // Draw cursor on current selection
+  int localIdx = galleryIndex - pageStart;
+  if (localIdx >= 0 && localIdx < GRID_ITEMS_PER_PAGE) {
+    drawGridCursor(localIdx % GRID_COLS, localIdx / GRID_COLS, TFT_CYAN);
+  }
+}
+
+// Render the full video grid page.
+void drawVideoGrid() {
+  if (galleryFileCount == 0) return;
+
+  int totalPages = (galleryFileCount + GRID_ITEMS_PER_PAGE - 1) / GRID_ITEMS_PER_PAGE;
+  if (gridPage >= totalPages) gridPage = totalPages - 1;
+  if (gridPage < 0) gridPage = 0;
+  int pageStart = gridPage * GRID_ITEMS_PER_PAGE;
+
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(middle_center);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawString("Loading thumbnails...", tft.width() / 2, 120);
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    xSemaphoreGive(spiMutex);
+  }
+
+  for (int i = 0; i < GRID_ITEMS_PER_PAGE; i++) {
+    int fileIdx = pageStart + i;
+    if (fileIdx >= galleryFileCount) break;
+    int col = i % GRID_COLS;
+    int row = i / GRID_COLS;
+    renderThumbCell(col, row, fileIdx, true);
+  }
+
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.setTextDatum(middle_center);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_CYAN);
+    char hdr[32];
+    snprintf(hdr, sizeof(hdr), "Videos  %d/%d", gridPage + 1, totalPages);
+    tft.drawString(hdr, tft.width() / 2, 10);
+
+    tft.setTextColor(0x4208);
+    tft.drawString("Turn:Move  Click:View  Long:Back", tft.width() / 2, 232);
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+
+  int localIdx = galleryIndex - pageStart;
+  if (localIdx >= 0 && localIdx < GRID_ITEMS_PER_PAGE) {
+    drawGridCursor(localIdx % GRID_COLS, localIdx / GRID_COLS, TFT_CYAN);
+  }
+}
+
 // Draw the gallery type selection menu (Photos / Videos).
 void drawGalleryTypeMenu() {
   if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
@@ -137,10 +330,10 @@ void drawGalleryTypeMenu() {
   }
 }
 
-// Display a single photo from the gallery.
+// Display a single photo detail view.
 // Reads JPEG file into dispBuf[0] (safe because taskCapture skips copy during gallery),
 // then decodes with LovyanGFX drawJpg at 0.25f scale (HD 1280x720 -> 320x180).
-void drawGalleryPhoto() {
+void drawGalleryPhotoView() {
   if (galleryFileCount == 0 || galleryIndex >= galleryFileCount) return;
   if (!globalSDState.isMounted) return;
 
@@ -245,10 +438,10 @@ size_t extractAVIFrame(File &aviFile, uint8_t *buf, size_t bufSize, int targetFr
   return 0;  // target frame not found
 }
 
-// Display a single video item with thumbnail background + overlaid play icon and info.
+// Display a single video detail view with thumbnail background + overlaid play icon and info.
 // Extracts frame 12 (0-indexed) from the AVI as thumbnail. Falls back to plain icon
 // if extraction fails.
-void drawGalleryVideoItem() {
+void drawGalleryVideoView() {
   if (galleryFileCount == 0 || galleryIndex >= galleryFileCount) return;
 
   const char *filePath = galleryFiles[galleryIndex];
@@ -386,7 +579,7 @@ void drawDeleteConfirm() {
 // Runs in taskDisplay context; consumes encoder events for pause/stop.
 void playVideoOnTFT() {
   if (galleryFileCount == 0 || galleryIndex >= galleryFileCount) {
-    appState = STATE_GALLERY_VIDEOS;
+    appState = STATE_GALLERY_VIDEO_VIEW;
     galleryNeedsRedraw = true;
     return;
   }
@@ -412,7 +605,7 @@ void playVideoOnTFT() {
       xSemaphoreGive(spiMutex);
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
-    appState = STATE_GALLERY_VIDEOS;
+    appState = STATE_GALLERY_VIDEO_VIEW;
     galleryNeedsRedraw = true;
     return;
   }
@@ -563,8 +756,8 @@ void playVideoOnTFT() {
     deleteSelection = 0;
     appState = STATE_DELETE_CONFIRM;
   } else {
-    // Natural EOF — return to video list
-    appState = STATE_GALLERY_VIDEOS;
+    // Natural EOF — return to video detail view
+    appState = STATE_GALLERY_VIDEO_VIEW;
   }
   galleryNeedsRedraw = true;
   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
