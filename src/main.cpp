@@ -106,9 +106,8 @@ void setup() {
   // Boot button (GPIO 0) no longer used — mirror and WiFi are in encoder menu.
   pinMode(SHUTTER_BTN_PIN_2, INPUT_PULLUP);
 
-  // LED flashlight output (GPIO4). Starts in the state saved by NVS.
-  // camSettings.flashlight_on is loaded later in loadCameraSettings(),
-  // so we initialise LOW here and apply the saved state after load.
+  // LED flashlight output (GPIO4). Always starts OFF — the LED only activates
+  // during photo capture or video recording, never in idle or menus.
   pinMode(LED_FLASHLIGHT_PIN, OUTPUT);
   digitalWrite(LED_FLASHLIGHT_PIN, LOW);
 
@@ -152,8 +151,6 @@ void setup() {
   // Load camera settings from NVS
   loadCameraSettings();
 
-  // Apply saved flashlight state now that NVS values are loaded
-  digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? HIGH : LOW);
 
   Serial.printf("Initial image no: %d, video no: %d\n", pictureNumber, videoNumber);
 
@@ -854,30 +851,18 @@ static void taskInput(void *pvParameters) {
                     if (cw) { if (*val < hi) (*val)++; }
                     else { if (*val > lo) (*val)--; }
                   }
-                  // Drive the LED immediately for live preview while editing
-                  if (settingsIndex == 11) {
-                    digitalWrite(LED_FLASHLIGHT_PIN, *val ? HIGH : LOW);
-                  }
                   galleryNeedsRedraw = true;
                   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                 } else if (ev.type == INPUT_ENC_CLICK) {
                   // Confirm edit — save to NVS immediately
                   settingsEditing = false;
                   saveCameraSettings();
-                  // Apply the flashlight GPIO state on confirm
-                  if (settingsIndex == 11) {
-                    digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? HIGH : LOW);
-                  }
                   galleryNeedsRedraw = true;
                   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                 } else if (ev.type == INPUT_ENC_LONG) {
                   // Cancel edit — revert to saved
                   loadCameraSettings();
                   settingsEditing = false;
-                  // Revert LED to saved state on cancel
-                  if (settingsIndex == 11) {
-                    digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? HIGH : LOW);
-                  }
                   galleryNeedsRedraw = true;
                   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                 }
@@ -1053,6 +1038,10 @@ static void taskCapture(void *pvParameters) {
         initMicrophone();
         recPoolWriteIdx = 0;
         recordingStartTime = millis();
+        // Turn LED on at recording start (flashlight = steady light, else blink starts in taskRecorder)
+        if (camSettings.flashlight_on) {
+          digitalWrite(LED_FLASHLIGHT_PIN, HIGH);
+        }
         appState = STATE_RECORDING;
         Serial.println("Recording started.");
       }
@@ -1080,8 +1069,8 @@ static void taskCapture(void *pvParameters) {
 
       deinitMicrophone();
 
-      // Restore LED to the user's flashlight setting (stops blink/video-light mode)
-      digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? HIGH : LOW);
+      // LED off — flashlight is only active during capture/recording
+      digitalWrite(LED_FLASHLIGHT_PIN, LOW);
 
       // close AVI file
       if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
@@ -1322,10 +1311,9 @@ static void drawStatusBar(float fps) {
 
 // ================= TASK: AVI RECORDER (Core 0, Priority 4) =================
 static void taskRecorder(void *pvParameters) {
-  // LED blink state for recording indicator.
-  // When flashlight_on == 0: blink at 1 Hz (500 ms on, 500 ms off).
-  // When flashlight_on == 1: LED stays on as a continuous video light.
-  unsigned long lastLedToggle = 0;
+  // Frame counter for 1 Hz LED blink when flashlight is off.
+  // At ~10 FPS, toggling every 5 frames gives ~1 Hz with zero millis() overhead.
+  int blinkFrameCount = 0;
   bool ledBlinkState = false;
 
   while (true) {
@@ -1334,24 +1322,19 @@ static void taskRecorder(void *pvParameters) {
       continue;
     }
 
-    // ── Recording LED indicator ──
-    if (appState == STATE_RECORDING) {
-      if (camSettings.flashlight_on) {
-        // Video light mode: keep LED on at all times
-        digitalWrite(LED_FLASHLIGHT_PIN, HIGH);
-      } else {
-        // No flashlight: blink at 1 Hz as a recording indicator
-        unsigned long now = millis();
-        if (now - lastLedToggle >= 500) {
-          lastLedToggle = now;
+    RecFrame rf;
+    if (xQueueReceive(recFrameQueue, &rf, pdMS_TO_TICKS(100)) == pdTRUE) {
+      // ── Recording LED blink (only when flashlight is off) ──
+      // Flashlight-on mode: LED was set HIGH at recording start, no work here.
+      if (appState == STATE_RECORDING && !camSettings.flashlight_on) {
+        blinkFrameCount++;
+        if (blinkFrameCount >= 5) {
+          blinkFrameCount = 0;
           ledBlinkState = !ledBlinkState;
           digitalWrite(LED_FLASHLIGHT_PIN, ledBlinkState ? HIGH : LOW);
         }
       }
-    }
 
-    RecFrame rf;
-    if (xQueueReceive(recFrameQueue, &rf, pdMS_TO_TICKS(100)) == pdTRUE) {
       // Read exactly one frame's worth of audio from the I2S DMA ring buffer.
       size_t audio_bytes_read = 0;
       if (i2s_rx_handle && audioRecBuf) {
@@ -1371,9 +1354,6 @@ static void taskRecorder(void *pvParameters) {
             writeAVIAudioChunk(videoFile, (uint8_t*)audioRecBuf, audio_bytes_read);
           }
           if (!ok) {
-            // Write failure here means SD is gone or full. Route through EVT_SD_STOP
-            // so the stop handler shows the error branch ("REC STOPPED / SD REMOVED")
-            // instead of the success "VIDEO SAVED" path.
             Serial.println("Write error! Requesting recording stop (SD lost).");
             xSemaphoreGive(spiMutex);
             xSemaphoreGive(recPoolFree);
@@ -1381,9 +1361,8 @@ static void taskRecorder(void *pvParameters) {
             while (appState == STATE_RECORDING) {
               vTaskDelay(pdMS_TO_TICKS(10));
             }
-            // Restore LED to user's flashlight setting on error exit
-            digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? HIGH : LOW);
-            lastLedToggle = 0;
+            digitalWrite(LED_FLASHLIGHT_PIN, LOW);
+            blinkFrameCount = 0;
             ledBlinkState = false;
             continue;
           }
@@ -1398,6 +1377,11 @@ static void taskRecorder(void *pvParameters) {
 // ================= PHOTO CAPTURE =================
 static void savePhotoHighRes() {
   appState = STATE_PHOTO;
+
+  // Turn on flashlight as fill light during photo capture
+  if (camSettings.flashlight_on) {
+    digitalWrite(LED_FLASHLIGHT_PIN, HIGH);
+  }
 
   // Show "HOLD ON..." — taskDisplay skips rendering during STATE_PHOTO
   if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
@@ -1504,6 +1488,9 @@ static void savePhotoHighRes() {
 
   // Keep notification visible for 1 second (STATE_PHOTO blocks taskDisplay)
   vTaskDelay(pdMS_TO_TICKS(1000));
+
+  // LED off — flashlight is only active during capture/recording
+  digitalWrite(LED_FLASHLIGHT_PIN, LOW);
 
   initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
   appState = STATE_IDLE;
