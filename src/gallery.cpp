@@ -762,3 +762,156 @@ void playVideoOnTFT() {
   galleryNeedsRedraw = true;
   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
 }
+
+// ================= SLIDESHOW MODE =================
+// Runs in taskDisplay context (Core 1).
+// Camera is deinited (STATE_SLIDESHOW is in taskCapture skip list).
+// Scans SD for .jpg files on entry, then cycles through them full-screen.
+// ENC_CLICK = pause/resume | ENC_LONG = exit to MENU_MAIN
+// Shutter = handled externally by taskInput (sets appState = STATE_MENU_MAIN)
+void runSlideshow() {
+  scanGalleryFiles(false);
+
+  if (galleryFileCount == 0) {
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextDatum(middle_center);
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_RED);
+      tft.drawString("No photos found", tft.width() / 2, 100);
+      tft.setTextSize(1);
+      tft.setTextColor(0x4208);
+      tft.drawString("Add photos to SD card", tft.width() / 2, 130);
+      tft.setTextDatum(top_left);
+      xSemaphoreGive(spiMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    freeGalleryFiles();
+    appState = STATE_MENU_MAIN;
+    galleryNeedsRedraw = true;
+    if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+    return;
+  }
+
+  int intervalMs = camSettings.slideshow_interval * 1000;
+  if (intervalMs < 1000) intervalMs = 3000;
+
+  Serial.printf("[SLIDE] Starting slideshow: %d photos, %ds interval\n",
+                galleryFileCount, camSettings.slideshow_interval);
+
+  galleryIndex = 0;
+  bool paused = false;
+  unsigned long lastAdvance = 0;
+
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(middle_center);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_MAGENTA);
+    tft.drawString("SLIDESHOW", tft.width() / 2, 120);
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+  vTaskDelay(pdMS_TO_TICKS(800));
+
+  while (appState == STATE_SLIDESHOW) {
+    InputEvent ev;
+    while (xQueueReceive(inputEventQueue, &ev, 0) == pdTRUE) {
+      if (ev.type == INPUT_ENC_CLICK) {
+        paused = !paused;
+        if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(50))) {
+          if (paused) {
+            tft.fillRect(4, 4, 26, 20, TFT_BLACK);
+            tft.fillRect(5, 5, 8, 18, TFT_WHITE);
+            tft.fillRect(16, 5, 8, 18, TFT_WHITE);
+          } else {
+            tft.fillRect(4, 4, 26, 20, TFT_BLACK);
+          }
+          xSemaphoreGive(spiMutex);
+        }
+      } else if (ev.type == INPUT_ENC_LONG) {
+        Serial.println("[SLIDE] ENC_LONG: exiting slideshow.");
+        freeGalleryFiles();
+        appState = STATE_MENU_MAIN;
+        galleryNeedsRedraw = true;
+        if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+        return;
+      }
+    }
+
+    if (paused) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    unsigned long now = millis();
+    bool timeToAdvance = (lastAdvance == 0) ||
+                         ((now - lastAdvance) >= (unsigned long)intervalMs);
+
+    if (timeToAdvance) {
+      const char *filePath = galleryFiles[galleryIndex];
+      uint8_t *jpgBuf = dispBuf[0];
+      size_t jpgLen = 0;
+
+      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+        File f = SD.open(filePath, FILE_READ);
+        if (f) {
+          size_t sz = f.size();
+          if (sz > 0 && sz <= DISP_BUF_SIZE && jpgBuf) {
+            jpgLen = f.read(jpgBuf, sz);
+          }
+          f.close();
+        }
+        xSemaphoreGive(spiMutex);
+      }
+
+      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+        tft.fillScreen(TFT_BLACK);
+        if (jpgLen > 0) {
+          tft.drawJpg(jpgBuf, jpgLen, 0, 30, 320, 180, 0, 0, 0.25f);
+        } else {
+          tft.setTextDatum(middle_center);
+          tft.setTextSize(1);
+          tft.setTextColor(TFT_RED);
+          tft.drawString("Cannot load photo", tft.width() / 2, 120);
+          tft.setTextDatum(top_left);
+        }
+        tft.fillRect(0, 0, 320, 28, TFT_BLACK);
+        tft.setTextDatum(middle_center);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_MAGENTA);
+        char hdr[32];
+        snprintf(hdr, sizeof(hdr), "Slideshow  %d / %d", galleryIndex + 1, galleryFileCount);
+        tft.drawString(hdr, tft.width() / 2, 10);
+        const char *dispName = filePath;
+        if (dispName[0] == '/') dispName++;
+        tft.setTextColor(0x7BEF);
+        tft.drawString(dispName, tft.width() / 2, 22);
+        tft.fillRect(0, 215, 320, 25, TFT_BLACK);
+        tft.setTextSize(1);
+        tft.setTextColor(0x4208);
+        tft.drawString("Click:Pause  Long:Exit", tft.width() / 2, 228);
+        tft.setTextDatum(top_left);
+        xSemaphoreGive(spiMutex);
+      }
+
+      galleryIndex = (galleryIndex + 1) % galleryFileCount;
+      lastAdvance = millis();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
+  Serial.println("[SLIDE] Slideshow ended.");
+  freeGalleryFiles();
+
+  // Only redirect to MENU_MAIN if we weren't already sent to a live state
+  // (e.g. shutter long-press → emergencyExitToIdle() → STATE_IDLE → recording).
+  AppState exitState = appState;
+  if (exitState == STATE_SLIDESHOW || exitState == STATE_MENU_MAIN) {
+    appState = STATE_MENU_MAIN;
+    galleryNeedsRedraw = true;
+    if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+  }
+  // Otherwise (STATE_IDLE, STATE_RECORDING, etc.) leave state and camera untouched.
+}

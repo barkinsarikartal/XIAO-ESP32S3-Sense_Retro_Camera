@@ -79,7 +79,7 @@
 #define IDLE_JPEG_QUALITY 0
 
 // ================= FIRMWARE VERSION =================
-#define FIRMWARE_VERSION "v1.6"
+#define FIRMWARE_VERSION "v1.7"
 
 // ================= WIFI AP CONFIG =================
 #define WIFI_SSID "Retro_Cam"
@@ -128,8 +128,8 @@
 #define THUMB_H            52
 
 // ================= MENU =================
-#define MENU_MAIN_ITEMS 5
-#define SETTINGS_COUNT  13
+#define MENU_MAIN_ITEMS 6
+#define SETTINGS_COUNT  15
 
 // ================= APP STATE & EVENTS =================
 enum AppState {
@@ -148,6 +148,8 @@ enum AppState {
   STATE_WIFI_MODE,
   STATE_SETTINGS,
   STATE_TIMELAPSE,
+  STATE_SELFTIMER_COUNTDOWN,  // self-timer: large digit on screen, fires photo at 0
+  STATE_SLIDESHOW,            // auto-advancing photo slideshow from gallery
 };
 
 #define EVT_START_RECORDING  (1 << 0)
@@ -189,6 +191,8 @@ struct CameraSettings {
   int timelapse_interval;  // seconds between captures (default: 10)
   int rec_max_seconds;     // 0=unlimited, >0=auto-stop after N seconds (default: 0)
   int flashlight_on;       // 0=off, 1=on (default: 0) — GPIO4 LED output
+  int selftimer_seconds;   // 0=off, 3, 5, or 10 seconds (default: 0)
+  int slideshow_interval;  // seconds per slide: 3, 5, or 10 (default: 5)
 };
 
 typedef struct { int idx; size_t len; } RecFrame;
@@ -323,6 +327,7 @@ void drawDeleteConfirm();
 void playVideoOnTFT();
 void drawGridCursor(int col, int row, uint16_t color);
 void clearGridCursor(int col, int row);
+void runSlideshow();
 
 // ================= FUNCTION PROTOTYPES — settings.cpp =================
 void loadCameraSettings();

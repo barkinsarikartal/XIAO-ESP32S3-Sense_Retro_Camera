@@ -25,7 +25,7 @@ volatile AppState appState = STATE_IDLE;
 EventGroupHandle_t appEvents;
 QueueHandle_t inputEventQueue = NULL;
 SDStatus globalSDState = {false, false, "NO CARD"};
-CameraSettings camSettings = { 1, 0, 2, 0, 0, 0, 1, 0, 12, 10, 0, 0 };
+CameraSettings camSettings = { 1, 0, 2, 0, 0, 0, 1, 0, 12, 10, 0, 0, 0, 5 };
 camera_config_t config;
 int pictureNumber = 0;
 int videoNumber = 0;
@@ -90,6 +90,7 @@ static void drawStatusBar(float fps);
 static void encoderISR();
 static void encSwISR();
 static void runTimelapse();
+static void runSelfTimerCountdown();
 
 // ================= SETUP =================
 void setup() {
@@ -424,7 +425,7 @@ static void taskInput(void *pvParameters) {
       if (dur < 1000) {
         // Short press
         if (appState == STATE_IDLE) {
-          // Take photo
+          // Take photo — respect self-timer if configured
           bool canSave = false;
           String errMsg = "";
           if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
@@ -434,11 +435,21 @@ static void taskInput(void *pvParameters) {
             xSemaphoreGive(spiMutex);
           }
           if (canSave) {
-            xEventGroupSetBits(appEvents, EVT_TAKE_PHOTO);
-            sendEvent(INPUT_BTN_SHORT);
+            if (camSettings.selftimer_seconds > 0) {
+              // Intercept: show countdown, then fire the photo at 0.
+              // taskDisplay will call runSelfTimerCountdown() which sends EVT_TAKE_PHOTO.
+              appState = STATE_SELFTIMER_COUNTDOWN;
+              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+            } else {
+              xEventGroupSetBits(appEvents, EVT_TAKE_PHOTO);
+              sendEvent(INPUT_BTN_SHORT);
+            }
           } else {
             showTFTMessage(errMsg.c_str(), TFT_RED, 2000);
           }
+        } else if (appState == STATE_SELFTIMER_COUNTDOWN) {
+          // Shutter press during countdown cancels it
+          appState = STATE_IDLE;
         } else if (appState == STATE_RECORDING && millis() - recordingStartTime > 2000) {
           // Stop recording
           xEventGroupSetBits(appEvents, EVT_STOP_RECORDING);
@@ -447,6 +458,10 @@ static void taskInput(void *pvParameters) {
           // Safe exit: use intermediate state so runTimelapse() handles camera cleanup.
           // Don't call emergencyExitToIdle() — it would race with camera ops in runTimelapse.
           appState = STATE_MENU_MAIN;
+        } else if (appState == STATE_SLIDESHOW) {
+          // Slideshow: short press = emergency exit to IDLE (reinit camera, same as other menus).
+          // runSlideshow() in taskDisplay detects the state change and exits its loop cleanly.
+          emergencyExitToIdle();
         } else if (appState == STATE_MENU_MAIN || appState == STATE_SETTINGS ||
                    appState == STATE_GALLERY_TYPE || appState == STATE_GALLERY_PHOTOS ||
                    appState == STATE_GALLERY_VIDEOS || appState == STATE_DELETE_CONFIRM ||
@@ -456,7 +471,7 @@ static void taskInput(void *pvParameters) {
           emergencyExitToIdle();
         }
       }
-      // Long press released: timelapse needs explicit handling (not in held isMenu list)
+      // Long press released: timelapse needs explicit cleanup; slideshow handled via isMenu below
       else if (appState == STATE_TIMELAPSE) {
         appState = STATE_MENU_MAIN;
       }
@@ -470,7 +485,7 @@ static void taskInput(void *pvParameters) {
       bool isMenu = (cs == STATE_MENU_MAIN || cs == STATE_SETTINGS ||
                      cs == STATE_GALLERY_TYPE || cs == STATE_GALLERY_PHOTOS ||
                      cs == STATE_GALLERY_VIDEOS || cs == STATE_DELETE_CONFIRM ||
-                     cs == STATE_VIDEO_PLAYING ||
+                     cs == STATE_VIDEO_PLAYING || cs == STATE_SLIDESHOW ||
                      cs == STATE_GALLERY_PHOTO_VIEW || cs == STATE_GALLERY_VIDEO_VIEW);
       if (shutterNow == LOW && (cs == STATE_IDLE || isMenu) &&
           (millis() - shutterPressTime > 1000) && shutterPressTime != 0) {
@@ -505,8 +520,9 @@ static void taskInput(void *pvParameters) {
 
     // ── Process encoder events from ISR queue ──
     // Unified consumer: all encoder-based state transitions handled here.
-    // Skipped during video playback and timelapse — those modes consume events directly.
-    if (appState != STATE_VIDEO_PLAYING && appState != STATE_TIMELAPSE) {
+    // Skipped during video playback, timelapse, and slideshow — those modes consume events directly.
+    if (appState != STATE_VIDEO_PLAYING && appState != STATE_TIMELAPSE &&
+        appState != STATE_SLIDESHOW && appState != STATE_SELFTIMER_COUNTDOWN) {
       InputEvent ev;
       while (xQueueReceive(inputEventQueue, &ev, 0) == pdTRUE) {
         if (ev.type != INPUT_ENC_CW && ev.type != INPUT_ENC_CCW &&
@@ -572,7 +588,18 @@ static void taskInput(void *pvParameters) {
                   galleryNeedsRedraw = true;
                   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                   break;
-                case 4: // Exit
+                case 4: // Slideshow — requires SD
+                  if (!globalSDState.isMounted) {
+                    showTFTMessage("SD REQUIRED!", TFT_RED, 2000);
+                    galleryNeedsRedraw = true;
+                    if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                    break;
+                  }
+                  appState = STATE_SLIDESHOW;
+                  galleryNeedsRedraw = true;
+                  if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+                  break;
+                case 5: // Exit
                   exitMenuToIdle();
                   break;
               }
@@ -909,6 +936,8 @@ static void taskInput(void *pvParameters) {
                 case 9: val = &camSettings.timelapse_interval; break;
                 case 10: val = &camSettings.rec_max_seconds;  break;
                 case 11: val = &camSettings.flashlight_on; lo = 0; hi = 1; break;
+                case 13: val = &camSettings.selftimer_seconds; break;
+                case 14: val = &camSettings.slideshow_interval; break;
               }
               if (val) {
                 if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
@@ -927,6 +956,20 @@ static void taskInput(void *pvParameters) {
                     for (int i = 0; i < n; i++) { if (p[i] >= *val) { ci = i; break; } if (i == n-1) ci = n-1; }
                     if (cw && ci < n-1) *val = p[ci+1];
                     else if (!cw && ci > 0) *val = p[ci-1];
+                  } else if (settingsIndex == 13) {
+                    // Self-timer: 0 (off), 3, 5, 10 seconds
+                    static const int sp[] = {0, 3, 5, 10};
+                    int sn = 4, sci = 0;
+                    for (int i = 0; i < sn; i++) { if (sp[i] >= *val) { sci = i; break; } if (i == sn-1) sci = sn-1; }
+                    if (cw && sci < sn-1) *val = sp[sci+1];
+                    else if (!cw && sci > 0) *val = sp[sci-1];
+                  } else if (settingsIndex == 14) {
+                    // Slideshow interval: 3, 5, 10 seconds
+                    static const int slp[] = {3, 5, 10};
+                    int sln = 3, slci = 0;
+                    for (int i = 0; i < sln; i++) { if (slp[i] >= *val) { slci = i; break; } if (i == sln-1) slci = sln-1; }
+                    if (cw && slci < sln-1) *val = slp[slci+1];
+                    else if (!cw && slci > 0) *val = slp[slci-1];
                   } else {
                     // Linear range settings
                     if (cw) { if (*val < hi) (*val)++; }
@@ -1045,14 +1088,17 @@ static void taskCapture(void *pvParameters) {
   static unsigned long camWdgLastReset = 0;
 
   while (true) {
-    // Skip capture when camera is deinited (WiFi mode, gallery states)
+    // Skip capture when camera is deinited (WiFi mode, gallery/menu/slideshow states).
+    // STATE_SELFTIMER_COUNTDOWN is NOT in this list — camera stays alive so taskCapture
+    // can process EVT_TAKE_PHOTO at countdown end.
     {
       AppState cs = appState;
       if (cs == STATE_WIFI_MODE || cs == STATE_MENU_MAIN || cs == STATE_SETTINGS ||
           cs == STATE_GALLERY_TYPE || cs == STATE_GALLERY_PHOTOS ||
           cs == STATE_GALLERY_VIDEOS || cs == STATE_DELETE_CONFIRM ||
           cs == STATE_VIDEO_PLAYING || cs == STATE_TIMELAPSE ||
-          cs == STATE_GALLERY_PHOTO_VIEW || cs == STATE_GALLERY_VIDEO_VIEW) {
+          cs == STATE_GALLERY_PHOTO_VIEW || cs == STATE_GALLERY_VIDEO_VIEW ||
+          cs == STATE_SLIDESHOW) {
         camWdgLastReset = 0;  // not in IDLE — reset timer when we return
         vTaskDelay(pdMS_TO_TICKS(100));
         continue;
@@ -1311,6 +1357,18 @@ static void taskDisplay(void *pvParameters) {
     // Timelapse — blocking capture loop until stopped
     if (appState == STATE_TIMELAPSE) {
       runTimelapse();
+      continue;
+    }
+
+    // Self-timer countdown — blocking digit display until 0 or cancelled
+    if (appState == STATE_SELFTIMER_COUNTDOWN) {
+      runSelfTimerCountdown();
+      continue;
+    }
+
+    // Slideshow — blocking photo cycling until stopped
+    if (appState == STATE_SLIDESHOW) {
+      runSlideshow();
       continue;
     }
 
@@ -1885,6 +1943,128 @@ static void runTimelapse() {
     xSemaphoreGive(spiMutex);
   }
   appState = STATE_IDLE;
+}
+
+// ================= SELF-TIMER COUNTDOWN =================
+// Runs in taskDisplay context (Core 1).
+// Camera stays ALIVE in IDLE mode — taskCapture continues to fill dispBuf,
+// but this function blocks taskDisplay from rendering those frames.
+// At countdown end, EVT_TAKE_PHOTO is fired and STATE_SELFTIMER_COUNTDOWN
+// transitions to STATE_PHOTO via the normal savePhotoHighRes() path in taskCapture.
+//
+// Cancellation: taskInput sets appState = STATE_IDLE on shutter/ENC_CLICK.
+// The while loop checks appState every 100ms and exits cleanly.
+static void runSelfTimerCountdown() {
+  int seconds = camSettings.selftimer_seconds;
+  if (seconds <= 0) {
+    // Timer unexpectedly 0 — fire immediately
+    xEventGroupSetBits(appEvents, EVT_TAKE_PHOTO);
+    appState = STATE_IDLE;
+    return;
+  }
+
+  Serial.printf("[TIMER] Self-timer started: %d seconds\n", seconds);
+
+  // Draw static chrome: title
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(middle_center);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("SELF TIMER", tft.width() / 2, 30);
+    tft.setTextSize(1);
+    tft.setTextColor(0x4208);
+    tft.drawString("Press shutter to cancel", tft.width() / 2, 225);
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+
+  // Drain any pending encoder events (don't process them during countdown)
+  {
+    InputEvent ev;
+    while (xQueueReceive(inputEventQueue, &ev, 0) == pdTRUE) { (void)ev; }
+  }
+
+  // Digit loop: one iteration per second
+  for (int remaining = seconds; remaining > 0; remaining--) {
+    if (appState != STATE_SELFTIMER_COUNTDOWN) {
+      // Cancelled externally (shutter button in taskInput)
+      Serial.println("[TIMER] Countdown cancelled.");
+      digitalWrite(LED_FLASHLIGHT_PIN, LOW);
+      // Drain encoder events that queued up during the blocked countdown
+      { InputEvent _ev; while (xQueueReceive(inputEventQueue, &_ev, 0) == pdTRUE) {} }
+      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+        tft.fillScreen(TFT_BLACK);
+        xSemaphoreGive(spiMutex);
+      }
+      return;
+    }
+
+    // Draw large digit
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+      tft.fillRect(0, 60, 320, 150, TFT_BLACK);
+      tft.setTextDatum(middle_center);
+      tft.setTextSize(8);
+      // Last second: red countdown; otherwise white
+      tft.setTextColor(remaining == 1 ? TFT_RED : TFT_WHITE);
+      char buf[4];
+      snprintf(buf, sizeof(buf), "%d", remaining);
+      tft.drawString(buf, tft.width() / 2, 130);
+      tft.setTextDatum(top_left);
+      xSemaphoreGive(spiMutex);
+    }
+
+    // LED blink pattern for one second:
+    // Last second = fast blink (100ms on/off x5), earlier = slow (500ms on/off x1)
+    if (remaining == 1) {
+      // Fast blink: 5 x (100ms ON + 100ms OFF) = 1000ms
+      for (int b = 0; b < 5 && appState == STATE_SELFTIMER_COUNTDOWN; b++) {
+        digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? LOW : HIGH);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? HIGH : LOW);
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+    } else {
+      // Slow blink: 500ms ON, 500ms OFF (invert if flashlight is on)
+      digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? LOW : HIGH);
+      vTaskDelay(pdMS_TO_TICKS(500));
+      if (appState == STATE_SELFTIMER_COUNTDOWN) {
+        digitalWrite(LED_FLASHLIGHT_PIN, camSettings.flashlight_on ? HIGH : LOW);
+        vTaskDelay(pdMS_TO_TICKS(500));
+      }
+    }
+  }
+
+  // Final check: still running? (cancelled during last blink delay)
+  if (appState != STATE_SELFTIMER_COUNTDOWN) {
+    digitalWrite(LED_FLASHLIGHT_PIN, LOW);
+    { InputEvent _ev; while (xQueueReceive(inputEventQueue, &_ev, 0) == pdTRUE) {} }
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+      tft.fillScreen(TFT_BLACK);
+      xSemaphoreGive(spiMutex);
+    }
+    return;
+  }
+
+  // Show camera emoji / flash
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.fillRect(0, 60, 320, 150, TFT_BLACK);
+    tft.setTextDatum(middle_center);
+    tft.setTextSize(3);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("CLICK!", tft.width() / 2, 130);
+    tft.setTextDatum(top_left);
+    xSemaphoreGive(spiMutex);
+  }
+
+  // Drain any encoder events that queued up during the countdown before firing.
+  { InputEvent _ev; while (xQueueReceive(inputEventQueue, &_ev, 0) == pdTRUE) {} }
+
+  // Return to IDLE then fire photo event.
+  // savePhotoHighRes() sets STATE_PHOTO itself; IDLE here lets taskCapture proceed.
+  appState = STATE_IDLE;
+  xEventGroupSetBits(appEvents, EVT_TAKE_PHOTO);
+  Serial.println("[TIMER] Countdown complete, firing photo.");
 }
 
 // ================= MENU HELPERS =================

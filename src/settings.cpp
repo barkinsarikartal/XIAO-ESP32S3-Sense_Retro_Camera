@@ -15,6 +15,8 @@ void loadCameraSettings() {
   camSettings.timelapse_interval = p.getInt("tlint", 10);
   camSettings.rec_max_seconds    = p.getInt("reclim", 0);
   camSettings.flashlight_on      = p.getInt("flash", 0);
+  camSettings.selftimer_seconds  = p.getInt("stimer", 0);
+  camSettings.slideshow_interval = p.getInt("slidiv", 5);
   p.end();
   Serial.println("[NVS] Camera settings loaded.");
 }
@@ -34,6 +36,8 @@ void saveCameraSettings() {
   p.putInt("tlint",  camSettings.timelapse_interval);
   p.putInt("reclim", camSettings.rec_max_seconds);
   p.putInt("flash",  camSettings.flashlight_on);
+  p.putInt("stimer", camSettings.selftimer_seconds);
+  p.putInt("slidiv", camSettings.slideshow_interval);
   p.end();
   Serial.println("[NVS] Camera settings saved.");
 }
@@ -70,10 +74,10 @@ void applySettings(sensor_t *s) {
 
 void drawMenuMain() {
   static const char* const labels[MENU_MAIN_ITEMS] = {
-    "Gallery", "WiFi Transfer", "Settings", "Timelapse", "Exit"
+    "Gallery", "WiFi Transfer", "Settings", "Timelapse", "Slideshow", "Exit"
   };
   static const uint16_t accents[MENU_MAIN_ITEMS] = {
-    TFT_CYAN, TFT_YELLOW, TFT_ORANGE, TFT_GREEN, 0x7BEF
+    TFT_CYAN, TFT_YELLOW, TFT_ORANGE, TFT_GREEN, TFT_MAGENTA, 0x7BEF
   };
 
   if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
@@ -82,22 +86,22 @@ void drawMenuMain() {
 
     tft.setTextSize(2);
     tft.setTextColor(TFT_WHITE);
-    tft.drawString("MENU", tft.width() / 2, 18);
+    tft.drawString("MENU", tft.width() / 2, 14);
 
-    int yStart = 45;
-    int itemH = 35;
+    int yStart = 35;
+    int itemH = 32;
     for (int i = 0; i < MENU_MAIN_ITEMS; i++) {
       int y = yStart + i * itemH;
       if (i == menuMainSelection) {
-        tft.fillRoundRect(50, y, 220, 30, 8, accents[i]);
+        tft.fillRoundRect(50, y, 220, 27, 8, accents[i]);
         tft.setTextSize(2);
         tft.setTextColor(TFT_BLACK);
       } else {
-        tft.drawRoundRect(50, y, 220, 30, 8, 0x4208);
+        tft.drawRoundRect(50, y, 220, 27, 8, 0x4208);
         tft.setTextSize(2);
         tft.setTextColor(0x7BEF);
       }
-      tft.drawString(labels[i], tft.width() / 2, y + 15);
+      tft.drawString(labels[i], tft.width() / 2, y + 13);
     }
 
     tft.setTextSize(1);
@@ -111,9 +115,10 @@ void drawMenuMain() {
 
 void drawSettingsMenu() {
   static const char* const names[SETTINGS_COUNT] = {
-    "Bright", "Contr", "Satur", "AE Lv",
-    "WB", "FX", "Mirror", "Flip", "JPEG Q",
-    "TL Int", "Rec Lim", "Light", "Rst Cnt"
+    "Brightness", "Contrast", "Saturation", "Auto Exposure Level",
+    "White Balance", "Effect", "Horizontal Mirror", "Vertical Flip", "JPEG Quality",
+    "Timelapse Interval", "Rec Limit", "Flashlight", "Reset Counter",
+    "Self Timer", "Slide Interval"
   };
   static const char* const wbLabels[] = {
     "Auto", "Sunny", "Cloud", "Office", "Home"
@@ -127,7 +132,8 @@ void drawSettingsMenu() {
     camSettings.ae_level, camSettings.wb_mode, camSettings.special_effect,
     camSettings.hmirror, camSettings.vflip, camSettings.jpeg_quality,
     camSettings.timelapse_interval, camSettings.rec_max_seconds,
-    camSettings.flashlight_on, resetCounterConfirm
+    camSettings.flashlight_on, resetCounterConfirm,
+    camSettings.selftimer_seconds, camSettings.slideshow_interval
   };
 
   if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
@@ -188,6 +194,13 @@ void drawSettingsMenu() {
         } else {
           snprintf(valBuf, sizeof(valBuf), "%dm", vals[i] / 60);
         }
+      } else if (i == 13) {
+        // S-Timer: 0 = Off, else Ns
+        if (vals[i] == 0) snprintf(valBuf, sizeof(valBuf), "Off");
+        else snprintf(valBuf, sizeof(valBuf), "%ds", vals[i]);
+      } else if (i == 14) {
+        // Slideshow interval: always in seconds
+        snprintf(valBuf, sizeof(valBuf), "%ds", vals[i]);
       } else {
         snprintf(valBuf, sizeof(valBuf), "%d", vals[i]);
       }

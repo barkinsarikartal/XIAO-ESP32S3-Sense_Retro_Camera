@@ -1,6 +1,6 @@
 # XIAO ESP32-S3 Sense Retro Camera
 
-A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Sense. Captures high-resolution photos and MJPEG/PCM audio video, with a live viewfinder on a 2.0" TFT display. Features a full encoder-driven menu system with on-device gallery (including video thumbnail previews), camera settings, timelapse mode, and a tabbed wireless file manager. Modular codebase with a multi-task FreeRTOS architecture for robust, concurrent operation.
+A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Sense. Captures high-resolution photos and MJPEG/PCM audio video, with a live viewfinder on a 2.0" TFT display. Features a full encoder-driven menu system with on-device gallery (including video thumbnail previews), camera settings, self-timer countdown, timelapse mode, photo slideshow, and a tabbed wireless file manager. Modular codebase with a multi-task FreeRTOS architecture for robust, concurrent operation.
 
 ---
 
@@ -9,11 +9,13 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **High-Resolution Photo Capture** — HD JPEG images (1280×720) saved to SD card
 - **Video Recording with Audio** — MJPEG video at 480×320, 10 FPS, with 16 kHz mono PCM audio via the built-in PDM microphone, saved as `.avi`
 - **Live Viewfinder** — Real-time 320×240 RGB565 camera preview on the TFT display
-- **Main Menu** — Encoder-driven main menu with Gallery, WiFi Transfer, Camera Settings, Timelapse, and Exit options
-- **Camera Settings** — On-device configuration of 13 parameters (brightness, contrast, saturation, AE level, white balance, special effects, mirror, flip, JPEG quality, timelapse interval, recording duration limit, flashlight toggle, file counter reset) with NVS persistence
+- **Main Menu** — Encoder-driven main menu with Gallery, WiFi Transfer, Camera Settings, Timelapse, Slideshow, and Exit options
+- **Camera Settings** — On-device configuration of 15 parameters (brightness, contrast, saturation, AE level, white balance, special effects, mirror, flip, JPEG quality, timelapse interval, recording duration limit, flashlight toggle, file counter reset, self-timer, slideshow interval) with NVS persistence
+- **Self-Timer** — Configurable countdown (3 / 5 / 10 s) before photo capture; large digit on TFT; LED blinks slowly then rapidly in the last second; cancel anytime with the shutter button
 - **Timelapse Mode** — Periodic HD photo capture at configurable intervals (5s–10min); TFT shows countdown, photo count, elapsed time; pause/resume/stop via encoder
+- **Slideshow Mode** — Auto-advance full-screen photo slideshow from the main menu; configurable interval (3 / 5 / 10 s); pause/resume (encoder click), exit (encoder long press), emergency exit (shutter)
 - **Recording Duration Limit** — Configurable auto-stop for video recording (30s–15min or unlimited)
-- **LED Flashlight & Recording Indicator** — General-purpose LED flashlight that also acts as a 1 Hz blinking recording indicator or continuous video light
+- **LED Flashlight & Recording Indicator** — General-purpose LED flashlight that also acts as a 1 Hz blinking recording indicator or continuous video light; also blinks as self-timer cue
 - **FPS Counter & SD Status** — Live overlay showing frame rate and SD card health
 - **WiFi File Server** — AP mode with a tabbed HTML file manager (Photos / Videos tabs with file count badges, sorted newest-first); download with browser progress bar, preview, delete individual files, **bulk-select and delete multiple files**, or **delete all** photos/videos in one tap; video thumbnail support
 - **On-Device Gallery** — Browse photos and videos in a **4×3 thumbnail grid** (12 items per page); drill into a full-screen detail view with encoder click; video thumbnails show a play icon overlay; page indicator shows current position
@@ -136,7 +138,7 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **Encoder click** from Idle → Main Menu
 - **Turn** (CW / CCW) to highlight an option, **click** to select
 - **Long press** at any level = go back (universal)
-- Menu items: **Gallery**, **WiFi Transfer**, **Settings**, **Timelapse**, **Exit**
+- Menu items: **Gallery**, **WiFi Transfer**, **Settings**, **Timelapse**, **Slideshow**, **Exit**
 
 ### Gallery (Photos & Videos)
 - Select "Gallery" from the main menu → Gallery type selector (Photos / Videos)
@@ -152,16 +154,32 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **File Deletion:** Confirmation dialog with Cancel/Delete before removing from SD; after deletion returns to grid view
 - **Shutter button** exits any menu/gallery state immediately (emergency exit)
 
+### Taking a Photo — Self-Timer
+- Open **Settings → Self Timer** and choose 3s, 5s, or 10s (default: Off)
+- Press the shutter button — the screen shows a large digit countdown with LED blink cues
+- LED blinks slowly for the first N-1 seconds, then rapidly in the final second (classic camera cue)
+- **Press shutter again at any time** to cancel the countdown
+- At 0 the photo is taken automatically via the normal HD capture path
+
 ### Camera Settings
 - Select "Settings" from the main menu
-- **CW / CCW** to browse the 12 parameters (scrollable list)
+- **CW / CCW** to browse the 15 parameters (scrollable list)
 - **Click** to enter edit mode (highlighted row turns yellow)
 - **CW / CCW** to adjust the value within its valid range
 - **Click** to confirm and save to NVS
 - **Long press** in edit mode cancels the change
 - **Long press** in browse mode returns to the main menu
-- Available settings: Brightness, Contrast, Saturation, AE Level, White Balance, Special Effect, Mirror, Flip, JPEG Quality, Timelapse Interval, Recording Limit, Light, Reset Counters
-- **Reset Counters (Rst Cnt):** Resets the photo and video file counters in NVS to 0. Uses a two-step confirm (No / YES) to prevent accidental resets. After confirming, a warning screen reminds you to back up your files via WiFi and delete them from the SD card before capturing new ones (the camera will skip over existing filenames automatically, but gallery display will be out of order until the SD is clean)
+- Available settings: Brightness, Contrast, Saturation, AE Level, White Balance, Effect, H Mirror, V Flip, JPEG Quality, TL Interval, Rec Limit, Flashlight, Reset Counter, Self Timer, Slide Interval
+- **Reset Counter:** Resets the photo and video file counters in NVS to 0. Uses a two-step confirm (No / YES) to prevent accidental resets. After confirming, a warning screen reminds you to back up your files via WiFi and delete them from the SD card before capturing new ones (the camera will skip over existing filenames automatically, but gallery display will be out of order until the SD is clean)
+
+### Slideshow Mode
+- Select **Slideshow** from the main menu (requires SD card with at least one photo)
+- Photos cycle full-screen automatically at the configured interval (Settings → Slide Interval: 3s / 5s / 10s)
+- Header bar shows current position (e.g. "Slideshow 2 / 8") and filename
+- **Encoder click** — pause / resume (two-bar indicator appears top-left when paused)
+- **Encoder long press** — exit to main menu
+- **Shutter short press** — emergency exit to idle viewfinder
+- **Shutter long press** — exit slideshow and immediately start video recording
 
 ### Timelapse Mode
 - Select "Timelapse" from the main menu (requires SD card)
@@ -263,7 +281,7 @@ Components are soldered on perfboard, powered by a 3.7 V 18650 Li-ion cell.
 | Photo save time | 3–5 seconds |
 | Video recording FPS | 9–10 FPS |
 | RAM usage | ~18.0% of 320 KB |
-| Flash usage | ~38.2% of 3.3 MB |
+| Flash usage | ~38.3% of 3.3 MB |
 
 ---
 
