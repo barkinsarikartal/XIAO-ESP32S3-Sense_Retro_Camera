@@ -112,8 +112,50 @@ void endAVI(File &file, int fps, int width, int height) {
   // needed), so total samples is exactly chunks × samples-per-chunk.
   uint32_t total_audio_samples = (uint32_t)avi_total_audio_chunks * AUDIO_SAMPLES_PER_FRAME;
 
-  // step 1: write idx1 at end of file
+  // step 1: write INFO LIST chunk at end of file (before idx1)
+  // Contains metadata visible in media players: artist, software, comment.
   file.seek(0, SeekEnd);
+
+  const char *infoArtist   = "github.com/barkinsarikartal";
+  const char *infoSoftware = "Retro Cam firmware " FIRMWARE_VERSION;
+  const char *infoComment  = "Retro Cam - XIAO ESP32-S3 Sense";
+
+  // Each INFO sub-chunk: 4-byte tag + 4-byte size + string (null-terminated, padded to even)
+  auto infoChunkSize = [](const char *str) -> uint32_t {
+    uint32_t len = strlen(str) + 1;  // include null terminator
+    if (len % 2 != 0) len++;         // pad to even boundary (RIFF requirement)
+    return len;
+  };
+  uint32_t iartSize = infoChunkSize(infoArtist);
+  uint32_t isftSize = infoChunkSize(infoSoftware);
+  uint32_t icmtSize = infoChunkSize(infoComment);
+  // LIST header: "LIST" (4) + listSize (4) + "INFO" (4)
+  // Sub-chunks: tag (4) + size (4) + data per chunk
+  uint32_t infoPayload = 4 + (4 + 4 + iartSize) + (4 + 4 + isftSize) + (4 + 4 + icmtSize);
+
+  file.write((const uint8_t*)"LIST", 4);
+  file.write((uint8_t*)&infoPayload, 4);
+  file.write((const uint8_t*)"INFO", 4);
+
+  // Helper lambda: write a single INFO sub-chunk
+  auto writeInfoChunk = [&](const char *tag, const char *str, uint32_t paddedSize) {
+    file.write((const uint8_t*)tag, 4);
+    file.write((uint8_t*)&paddedSize, 4);
+    file.write((const uint8_t*)str, strlen(str) + 1);
+    // Pad to even boundary if needed
+    if ((strlen(str) + 1) % 2 != 0) {
+      uint8_t pad = 0;
+      file.write(&pad, 1);
+    }
+  };
+
+  writeInfoChunk("IART", infoArtist, iartSize);
+  writeInfoChunk("ISFT", infoSoftware, isftSize);
+  writeInfoChunk("ICMT", infoComment, icmtSize);
+
+
+
+  // step 2: write idx1 at end of file
   file.write((const uint8_t*)"idx1", 4);
   int total_idx_entries = avi_total_chunks;
   uint32_t idx1Size = total_idx_entries * 16;
@@ -144,7 +186,7 @@ void endAVI(File &file, int fps, int width, int height) {
     }
   }
 
-  // step 2: capture exact file position right after idx1 — file.size() may return
+  // step 3: capture exact file position right after idx1 — file.size() may return
   // stale data before FAT commits, which caused riffSize = 0xFFFFFFF8 in MediaInfo.
   uint32_t totalSize = (uint32_t)file.position();
   uint32_t riffSize  = totalSize - 8;

@@ -79,7 +79,7 @@
 #define IDLE_JPEG_QUALITY 0
 
 // ================= FIRMWARE VERSION =================
-#define FIRMWARE_VERSION "v1.4"
+#define FIRMWARE_VERSION "v1.5"
 
 // ================= WIFI AP CONFIG =================
 #define WIFI_SSID "Retro_Cam"
@@ -316,5 +316,9 @@ void saveCameraSettings();
 void applySettings(sensor_t *s);
 void drawSettingsMenu();
 void drawMenuMain();
+
+// ================= FUNCTION PROTOTYPES — exif_writer.cpp =================
+void buildExifBlock();
+size_t getExifBlock(const uint8_t **out);
 
 #endif // SHARED_H

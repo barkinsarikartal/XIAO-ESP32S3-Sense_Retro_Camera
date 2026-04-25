@@ -151,6 +151,9 @@ void setup() {
   // Load camera settings from NVS
   loadCameraSettings();
 
+  // Build EXIF metadata block (cached in PSRAM for all photo saves)
+  buildExifBlock();
+
 
   Serial.printf("Initial image no: %d, video no: %d\n", pictureNumber, videoNumber);
 
@@ -1434,15 +1437,27 @@ static void savePhotoHighRes() {
 
         File file = SD.open(path.c_str(), FILE_WRITE);
         if (file) {
-          size_t written = file.write(fb->buf, fb->len);
+          // Write SOI (first 2 bytes) + EXIF block + rest of JPEG
+          const uint8_t *exifData = nullptr;
+          size_t exifLen = getExifBlock(&exifData);
+          bool writeOk = true;
+          // SOI marker (0xFFD8)
+          if (file.write(fb->buf, 2) != 2) writeOk = false;
+          // EXIF APP1 segment
+          if (writeOk && exifLen > 0 && exifData) {
+            if (file.write(exifData, exifLen) != exifLen) writeOk = false;
+          }
+          // Rest of JPEG (skip SOI)
+          size_t remaining = fb->len - 2;
+          if (writeOk && file.write(fb->buf + 2, remaining) != remaining) writeOk = false;
           file.close();
-          if (written == fb->len) {
+          if (writeOk) {
             Serial.println("SUCCESS!");
             pictureNumber++;
             { Preferences p; p.begin("cnt", false); p.putInt("pic", pictureNumber); p.end(); }
             saved = true;
           } else {
-            Serial.printf("[ERR] Photo write incomplete: %u/%u bytes\n", written, fb->len);
+            Serial.printf("[ERR] Photo write incomplete (EXIF inject)\n");
             writeErr = true;
           }
         }
@@ -1678,16 +1693,25 @@ static void runTimelapse() {
             }
             File file = SD.open(path.c_str(), FILE_WRITE);
             if (file) {
-              size_t written = file.write(fb->buf, fb->len);
+              // Write SOI + EXIF + rest of JPEG (same pattern as savePhotoHighRes)
+              const uint8_t *exifData = nullptr;
+              size_t exifLen = getExifBlock(&exifData);
+              bool writeOk = true;
+              if (file.write(fb->buf, 2) != 2) writeOk = false;
+              if (writeOk && exifLen > 0 && exifData) {
+                if (file.write(exifData, exifLen) != exifLen) writeOk = false;
+              }
+              size_t remaining = fb->len - 2;
+              if (writeOk && file.write(fb->buf + 2, remaining) != remaining) writeOk = false;
               file.close();
-              if (written == fb->len) {
+              if (writeOk) {
                 pictureNumber++;
                 { Preferences p; p.begin("cnt", false); p.putInt("pic", pictureNumber); p.end(); }
                 captureCount++;
                 saved = true;
                 Serial.printf("[TL] Saved: %s (%u bytes)\n", path.c_str(), fb->len);
               } else {
-                Serial.printf("[TL] Write incomplete: %u/%u bytes\n", written, fb->len);
+                Serial.printf("[TL] Write incomplete (EXIF inject)\n");
               }
             }
           }
