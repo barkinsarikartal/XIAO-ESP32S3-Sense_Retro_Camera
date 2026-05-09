@@ -91,6 +91,7 @@ static void encoderISR();
 static void encSwISR();
 static void runTimelapse();
 static void runSelfTimerCountdown();
+static void runBootAnimation();
 
 // ================= SETUP =================
 void setup() {
@@ -125,20 +126,12 @@ void setup() {
   SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, SD_CS_PIN);
   delay(100);
 
-  // TFT
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
 
-  tft.setTextDatum(middle_center);
-  tft.setTextColor(TFT_WHITE);
-  tft.setTextSize(3);
-  tft.drawString("GETTING READY", tft.width() / 2, 75);
-  tft.setTextSize(3);
-  tft.drawString("PLEASE WAIT..", tft.width() / 2, 115);
-  tft.setTextSize(2);
-  tft.drawString("github@barkinsarikartal", tft.width() / 2, 200); // mini ad here :)
-  tft.setTextDatum(top_left);
+  // Boot animation — retro first impression before hardware init
+  runBootAnimation();
 
   // Load file counters from NVS
   {
@@ -154,7 +147,6 @@ void setup() {
 
   // Build EXIF metadata block (cached in PSRAM for all photo saves)
   buildExifBlock();
-
 
   Serial.printf("Initial image no: %d, video no: %d\n", pictureNumber, videoNumber);
 
@@ -1227,6 +1219,7 @@ static void taskCapture(void *pvParameters) {
         xSemaphoreGive(spiMutex);
       }
       Serial.println("Recording stopped.");
+
       vTaskDelay(pdMS_TO_TICKS(1000));  // keep notification visible
 
       initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
@@ -2096,4 +2089,58 @@ void exitMenuToIdle() {
     xSemaphoreGive(spiMutex);
   }
   appState = STATE_IDLE;
+}
+
+// ================= BOOT ANIMATION =================
+// Retro startup sequence: colour-stepping fade-in of the title text,
+// LED flash accent, and subtitle. Runs once during setup(), ~2 seconds.
+// Uses direct TFT calls (no spiMutex needed — tasks haven't started yet).
+static void runBootAnimation() {
+  tft.fillScreen(TFT_BLACK);
+  delay(200);
+
+  // Fade-in "RETRO CAM" — 6 steps from dark grey to white
+  static const uint16_t fadeSteps[] = {
+    tft.color565(30, 30, 30),
+    tft.color565(70, 70, 70),
+    tft.color565(120, 120, 120),
+    tft.color565(180, 180, 180),
+    tft.color565(230, 230, 230),
+    TFT_WHITE
+  };
+
+  tft.setTextDatum(middle_center);
+  for (int i = 0; i < 6; i++) {
+    tft.setTextSize(4);
+    tft.setTextColor(fadeSteps[i], TFT_BLACK);
+    tft.drawString("RETRO CAM", tft.width() / 2, 100);
+    delay(80);
+  }
+
+  // LED flash — brief camera-flash effect
+  digitalWrite(LED_FLASHLIGHT_PIN, HIGH);
+  delay(120);
+  digitalWrite(LED_FLASHLIGHT_PIN, LOW);
+
+  // Subtitle fade-in
+  delay(150);
+  tft.setTextSize(2);
+  tft.setTextColor(tft.color565(80, 80, 80), TFT_BLACK);
+  tft.drawString("github/barkinsarikartal", tft.width() / 2, 145);
+  delay(100);
+  tft.setTextColor(0x7BEF, TFT_BLACK);  // light grey
+  tft.drawString("github/barkinsarikartal", tft.width() / 2, 145);
+
+  // Firmware version tag
+  delay(100);
+  tft.setTextSize(2);
+  tft.setTextColor(tft.color565(60, 60, 60));
+  tft.drawString(FIRMWARE_VERSION, tft.width() / 2, 170);
+
+  // Hold for readability
+  delay(800);
+
+  // Clear for next screen
+  //tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(top_left);
 }

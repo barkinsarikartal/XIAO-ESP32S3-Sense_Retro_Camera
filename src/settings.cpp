@@ -73,37 +73,70 @@ void applySettings(sensor_t *s) {
 }
 
 void drawMenuMain() {
-  static const char* const labels[MENU_MAIN_ITEMS] = {
-    "Gallery", "WiFi Transfer", "Settings", "Timelapse", "Slideshow", "Exit"
+  // 3×2 grid labels — each item has a two-line label for readability.
+  // Line 1 is primary text, line 2 is secondary (can be empty).
+  static const char* const line1[MENU_MAIN_ITEMS] = {
+    "Gallery", "WiFi", "Settings", "Time-", "Slide-", "Exit"
+  };
+  static const char* const line2[MENU_MAIN_ITEMS] = {
+    "", "Transfer", "", "lapse", "show", ""
   };
   static const uint16_t accents[MENU_MAIN_ITEMS] = {
     TFT_CYAN, TFT_YELLOW, TFT_ORANGE, TFT_GREEN, TFT_MAGENTA, 0x7BEF
   };
 
+  // Grid geometry: 3 columns × 2 rows
+  const int cols = 3;
+  const int cellW = 96;
+  const int cellH = 80;
+  const int gapX  = 6;
+  const int gapY  = 8;
+  const int marginX = (320 - cols * cellW - (cols - 1) * gapX) / 2;  // 7px
+  const int titleH  = 30;
+  const int gridY   = titleH + 4;
+
   if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
     tft.fillScreen(TFT_BLACK);
     tft.setTextDatum(middle_center);
 
+    // Title
     tft.setTextSize(2);
     tft.setTextColor(TFT_WHITE);
     tft.drawString("MENU", tft.width() / 2, 14);
 
-    int yStart = 35;
-    int itemH = 32;
+    // Draw each cell
     for (int i = 0; i < MENU_MAIN_ITEMS; i++) {
-      int y = yStart + i * itemH;
+      int col = i % cols;
+      int row = i / cols;
+      int x = marginX + col * (cellW + gapX);
+      int y = gridY + row * (cellH + gapY);
+
       if (i == menuMainSelection) {
-        tft.fillRoundRect(50, y, 220, 27, 8, accents[i]);
-        tft.setTextSize(2);
+        // Selected: filled rounded rect in accent colour
+        tft.fillRoundRect(x, y, cellW, cellH, 8, accents[i]);
         tft.setTextColor(TFT_BLACK);
       } else {
-        tft.drawRoundRect(50, y, 220, 27, 8, 0x4208);
-        tft.setTextSize(2);
+        // Unselected: thin border in dim grey
+        tft.drawRoundRect(x, y, cellW, cellH, 8, 0x4208);
         tft.setTextColor(0x7BEF);
       }
-      tft.drawString(labels[i], tft.width() / 2, y + 13);
+
+      // Two-line label centred in the cell
+      int cx = x + cellW / 2;
+      int cy = y + cellH / 2;
+      bool hasLine2 = (line2[i][0] != '\0');
+
+      if (hasLine2) {
+        tft.setTextSize(2);
+        tft.drawString(line1[i], cx, cy - 8);
+        tft.drawString(line2[i], cx, cy + 10);
+      } else {
+        tft.setTextSize(2);
+        tft.drawString(line1[i], cx, cy);
+      }
     }
 
+    // Footer
     tft.setTextSize(1);
     tft.setTextColor(0x4208);
     tft.drawString("Click: Select  Long: Exit", tft.width() / 2, 225);
@@ -112,6 +145,7 @@ void drawMenuMain() {
     xSemaphoreGive(spiMutex);
   }
 }
+
 
 void drawSettingsMenu() {
   static const char* const names[SETTINGS_COUNT] = {
