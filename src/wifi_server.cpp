@@ -456,28 +456,8 @@ void startWiFiMode() {
   webServer->begin();
   Serial.println("[WIFI] Web server started on port 80.");
 
-  // Draw info screen on TFT
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextDatum(middle_center);
-    tft.setTextColor(TFT_CYAN);
-    tft.setTextSize(2);
-    tft.drawString("WiFi Active", tft.width() / 2, 50);
-    tft.setTextColor(TFT_WHITE);
-    tft.setTextSize(2);
-    tft.drawString("SSID:", tft.width() / 2, 95);
-    tft.setTextColor(TFT_GREEN);
-    tft.drawString(WIFI_SSID, tft.width() / 2, 120);
-    tft.setTextColor(TFT_WHITE);
-    tft.drawString("IP:", tft.width() / 2, 155);
-    tft.setTextColor(TFT_YELLOW);
-    tft.drawString(ip.toString().c_str(), tft.width() / 2, 180);
-    tft.setTextColor(0x7BEF);  // dim grey
-    tft.setTextSize(1);
-    tft.drawString("Press to exit", tft.width() / 2, 220);
-    tft.setTextDatum(top_left);
-    xSemaphoreGive(spiMutex);
-  }
+  // Draw QR code + text credentials on TFT
+  drawWiFiQRScreen(ip);
 }
 
 // Stop WiFi mode: tear down server + AP, reinit camera, return to IDLE.

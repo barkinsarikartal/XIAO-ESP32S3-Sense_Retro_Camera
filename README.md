@@ -17,7 +17,7 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 - **Recording Duration Limit** — Configurable auto-stop for video recording (30s–15min or unlimited)
 - **LED Flashlight & Recording Indicator** — General-purpose LED flashlight that also acts as a 1 Hz blinking recording indicator or continuous video light; also blinks as self-timer cue
 - **FPS Counter & SD Status** — Live overlay showing frame rate and SD card health
-- **WiFi File Server** — AP mode with a tabbed HTML file manager (Photos / Videos tabs with file count badges, sorted newest-first); download with browser progress bar, preview, delete individual files, **bulk-select and delete multiple files**, or **delete all** photos/videos in one tap; video thumbnail support
+- **WiFi File Server** — AP mode with a tabbed HTML file manager (Photos / Videos tabs with file count badges, sorted newest-first); download with browser progress bar, preview, delete individual files, **bulk-select and delete multiple files**, or **delete all** photos/videos in one tap; video thumbnail support; **QR code pairing screen** on the TFT displays credentials and a scannable WIFI: QR code for instant phone connection
 - **On-Device Gallery** — Browse photos and videos in a **4×3 thumbnail grid** (12 items per page); drill into a full-screen detail view with encoder click; video thumbnails show a play icon overlay; page indicator shows current position
 - **Silent Video Playback** — Plays AVI recordings on the TFT by parsing MOVI JPEG chunks; frame timing derived from the AVI header's `microSecPerFrame` for accurate real-time speed; pause/resume/stop via encoder
 - **File Deletion** — Delete photos and videos directly from the device with a confirmation dialog
@@ -121,7 +121,9 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 
 ### WiFi File Manager
 - Select **WiFi Transfer** from the main menu (requires SD card)
-- Connect your phone/PC to `Retro_Cam` (password: `barkinsarikartal`)
+- The TFT shows a **split-screen pairing display**: text credentials on the left (SSID, password, IP) and a **scannable QR code** on the right
+  - **Phone users:** point your camera at the QR code — iOS and Android recognise the `WIFI:` URI format and offer a one-tap "Connect to WiFi" prompt, no password typing needed
+  - **PC/laptop users:** connect manually to `Retro_Cam` (password: `barkinsarikartal`)
 - Navigate to `http://192.168.4.1` — tabbed interface: **Photos** and **Videos** tabs, each sorted **newest-first** with file count badges
 - Both photos and videos display thumbnail previews; video thumbnails are extracted from frame ~1.2 s into the clip
 - Downloads include a `Content-Length` header so the browser shows a progress bar with percentage
@@ -199,6 +201,7 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 | `wifi_server.cpp` | WiFi AP + async web server with tabbed HTML file manager |
 | `gallery.cpp` | On-device gallery: photo/video browsing, AVI frame extraction, video playback |
 | `settings.cpp` | Camera settings: NVS load/save, applySettings, settings & main menu UI |
+| `qr_render.cpp` | WiFi pairing screen: QR code generation (WIFI: URI) + split-screen TFT layout |
 
 
 ## Technical Details
@@ -281,7 +284,7 @@ Components are soldered on perfboard, powered by a 3.7 V 18650 Li-ion cell.
 | Photo save time | 3–5 seconds |
 | Video recording FPS | 9–10 FPS |
 | RAM usage | ~18.0% of 320 KB |
-| Flash usage | ~38.3% of 3.3 MB |
+| Flash usage | ~38.5% of 3.3 MB |
 
 ---
 
