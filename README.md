@@ -36,7 +36,7 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 | Display | 2.0" TFT LCD — ST7789VW, 240×320, SPI |
 | Rotary Encoder | EC11 with push button (CLK: GPIO 6, DT: GPIO 43, SW: GPIO 44) |
 | Shutter button | 1× tactile button (GPIO 5 to GND) |
-| LED Flashlight | 2× 5mm white LEDs (GPIO 4) |
+| LED Flashlights | 2× 5mm white LEDs with 100Ω resistor (GPIO 4) |
 | Storage | MicroSD card, FAT32 formatted |
 | Power | 3.7 V Li-ion battery or USB-C |
 
@@ -71,8 +71,7 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
           <tr><td>Encoder DT</td><td>GPIO 43 (INPUT_PULLUP)</td></tr>
           <tr><td>Encoder SW (Button)</td><td>GPIO 44 (INPUT_PULLUP)</td></tr>
           <tr><td>Shutter</td><td>GPIO 5 (INPUT_PULLUP to GND)</td></tr>
-          <tr><td>LED Flashlight</td><td>GPIO 4 (OUTPUT)</td></tr>
-          <tr><td>Boot button</td><td>GPIO 0 (disabled — mirror via Settings menu)</td></tr>
+          <tr><td>LED Flashlights with 100Ω Resistor</td><td>GPIO 4 (OUTPUT)</td></tr>
           <tr><td>SD Card CS</td><td>GPIO 21</td></tr>
           <tr><td>Mic CLK (PDM)</td><td>GPIO 42</td></tr>
           <tr><td>Mic DATA (PDM)</td><td>GPIO 41</td></tr>
