@@ -98,6 +98,11 @@ The enclosure is fully 3D-printable. STL files for the camera case are included 
 
 **Assembly hardware:** 8× M3×5.75 brass heat-set inserts + 8× M3×5 screws.
 
+<div align="center">
+  <img src="images/box1.jpg" width="400" alt="Camera case – view 1">
+  <img src="images/box2.jpg" width="400" alt="Camera case – view 2">
+</div>
+
 ### XIAO ESP32-S3 Sense Case
 
 | File | Source |
