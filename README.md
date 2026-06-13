@@ -85,6 +85,36 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 
 ---
 
+## 3D Printable Parts
+
+The enclosure is fully 3D-printable. STL files for the camera case are included in the [`models/`](models/) directory; the XIAO case and accessory parts are sourced from the community.
+
+### Camera Case (included in repo)
+
+| File | Description |
+|---|---|
+| [`box_final.stl`](models/box_final.stl) | Main body / enclosure box |
+| [`cam_final.stl`](models/cam_final.stl) | Front camera mount |
+| [`2inc_tft_final.stl`](models/2inc_tft_final.stl) | Rear TFT display frame (2.0" ST7789) |
+
+**Assembly hardware:** 8× M3×5.75 brass heat-set inserts + 8× M3×5 screws.
+
+### XIAO ESP32-S3 Sense Case
+
+| File | Source |
+|---|---|
+| [`xiao_case_right.stl`](models/xiao_case_right.stl) | [XIAO Sense Case – Printables #681623](https://www.printables.com/model/681623-xiao-sense-case-seeed-studio-xiao-esp32s3-sense-ca) |
+| [`xiao_case_left.stl`](models/xiao_case_left.stl) | Same source (left half) |
+
+### External Parts (MakerWorld)
+
+| Part | Link |
+|---|---|
+| Shutter Button Assembly (18 mm cap for 6 mm push button) | [MakerWorld #628744](https://makerworld.com/tr/models/628744-18mm-button-assembly-for-6mm-push-buttons) |
+| EC11 Encoder Knob (split shaft) | [MakerWorld #2430821](https://makerworld.com/tr/models/2430821-ec11-encoder-knob-split-shaft) |
+
+---
+
 ## Installation & Setup
 
 ### PlatformIO (Recommended)
