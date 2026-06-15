@@ -4,6 +4,18 @@ A compact retro-styled digital camera built on the Seeed Studio XIAO ESP32-S3 Se
 
 ---
 
+## Demo Video
+
+<div align="center">
+  <a href="https://youtu.be/0UTXGptOVkc">
+    <img src="https://i.ytimg.com/vi/0UTXGptOVkc/hqdefault.jpg" width="700" alt="XIAO ESP32-S3 Retro Camera — Demo Video">
+  </a>
+  <br>
+  <strong><a href="https://youtu.be/0UTXGptOVkc">Watch the full demo on YouTube</a></strong>
+</div>
+
+---
+
 ## Features
 
 - **High-Resolution Photo Capture** — HD JPEG images (1280×720) saved to SD card
